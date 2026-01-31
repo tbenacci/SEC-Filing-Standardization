@@ -1,0 +1,186 @@
+---
+title: "Rollup to Compustat Tags"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  facts_file: "F:/LostInStandardization/output/extracted_facts.csv"
+  lookup_file: "F:/LostInStandardization/output/tag_lookup.tsv"
+  output_path: "F:/LostInStandardization/output"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+```
+
+# Overview
+
+The lookup table defines which XBRL tags roll up to which Compustat tags.
+Built from the latest available taxonomy and applied uniformly to all filings.
+
+```{r packages}
+library(data.table)
+setDTthreads(0)
+```
+
+# Step 1: Build Rollup Rules from Lookup
+
+```{r load-lookup}
+LOOKUP <- fread(params$lookup_file)
+cat("Lookup:\n")
+cat("  Rows:", format(nrow(LOOKUP), big.mark = ","), "\n")
+cat("  Columns:", paste(names(LOOKUP), collapse = ", "), "\n")
+cat("  Unique compustat targets:", uniqueN(LOOKUP$compustat_name), "\n")
+```
+
+# Step 2: Load Facts
+
+```{r load-facts}
+FACTS <- fread(params$facts_file)
+cat("Facts loaded:\n")
+cat("  Rows:", format(nrow(FACTS), big.mark = ","), "\n")
+cat("  Columns:", paste(names(FACTS), collapse = ", "), "\n")
+```
+
+```{r filter-current-period}
+# Each filing (accn) contains data for multiple periods (current + comparisons)
+# A single 10-K may contain full-year AND quarterly breakdowns for the same tag
+# We need to select the appropriate period based on filing type:
+#   - 10-K/10-K/A: want full-year rows (duration > 300 days)
+#   - 10-Q/10-Q/A: want single-quarter rows (duration < 120 days)
+
+FACTS[, end := as.IDate(end)]
+FACTS[, start := as.IDate(start)]
+FACTS[, duration := as.integer(end - start)]
+
+# Classify filing type
+FACTS[, is_annual := form %chin% c("10-K", "10-K/A", "10-KT", "10-KT/A")]
+
+# For annual filings: keep full-year rows (duration > 300 days)
+# For quarterly filings: keep single-quarter rows (duration 60-120 days typical)
+FACTS_ANNUAL <- FACTS[is_annual == TRUE & duration > 300]
+FACTS_QUARTERLY <- FACTS[is_annual == FALSE & duration < 120 & duration > 60]
+
+# Fallback: if no rows match duration criteria, use original logic (max end)
+FACTS_ANNUAL_FALLBACK <- FACTS[is_annual == TRUE & !paste(cik, accn, tag) %chin% 
+                                paste(FACTS_ANNUAL$cik, FACTS_ANNUAL$accn, FACTS_ANNUAL$tag)]
+FACTS_QUARTERLY_FALLBACK <- FACTS[is_annual == FALSE & !paste(cik, accn, tag) %chin% 
+                                   paste(FACTS_QUARTERLY$cik, FACTS_QUARTERLY$accn, FACTS_QUARTERLY$tag)]
+
+# For fallbacks, take max end date
+if (nrow(FACTS_ANNUAL_FALLBACK) > 0) {
+  setorder(FACTS_ANNUAL_FALLBACK, cik, accn, tag, -end, -duration)
+  FACTS_ANNUAL_FALLBACK <- FACTS_ANNUAL_FALLBACK[, .SD[1], by = .(cik, accn, tag)]
+}
+if (nrow(FACTS_QUARTERLY_FALLBACK) > 0) {
+  setorder(FACTS_QUARTERLY_FALLBACK, cik, accn, tag, -end)
+  FACTS_QUARTERLY_FALLBACK <- FACTS_QUARTERLY_FALLBACK[, .SD[1], by = .(cik, accn, tag)]
+}
+
+# For main sets, also dedup (in case of ties)
+if (nrow(FACTS_ANNUAL) > 0) {
+  setorder(FACTS_ANNUAL, cik, accn, tag, -end, -duration)
+  FACTS_ANNUAL <- FACTS_ANNUAL[, .SD[1], by = .(cik, accn, tag)]
+}
+if (nrow(FACTS_QUARTERLY) > 0) {
+  setorder(FACTS_QUARTERLY, cik, accn, tag, -end)
+  FACTS_QUARTERLY <- FACTS_QUARTERLY[, .SD[1], by = .(cik, accn, tag)]
+}
+
+# Combine all
+FACTS <- rbindlist(list(FACTS_ANNUAL, FACTS_ANNUAL_FALLBACK, 
+                        FACTS_QUARTERLY, FACTS_QUARTERLY_FALLBACK), fill = TRUE)
+FACTS[, c("duration", "is_annual") := NULL]
+
+cat("\nAfter filtering to current period only:\n")
+cat("  Rows:", format(nrow(FACTS), big.mark = ","), "\n")
+```
+
+# Step 3: Apply Rollup Calculations (Vectorized)
+
+Prefer directly reported values. Only roll up from children if parent tag is missing.
+
+```{r rollup}
+# Flatten lookup: one row per (compustat_name, child_tag, weight)
+FLAT <- LOOKUP[, .(
+  compustat_name, 
+  target_tag, 
+  child_tag, 
+  weight = weight_path
+)]
+cat("Flattened lookup:", format(nrow(FLAT), big.mark = ","), "rows\n")
+# Step 3a: Get directly reported values for target tags
+# These are facts where tag == target_tag (the compustat-level tag itself)
+target_tags <- unique(FLAT$target_tag)
+REPORTED <- FACTS[tag %chin% target_tags, .(
+  cik, entity, accn, form, fy, fp, filed, start, end, tax_year,
+  target_tag = tag,
+  val, unit,
+  source = "reported"
+)]
+# Add compustat_name
+tag_info <- unique(FLAT[, .(target_tag, compustat_name)])
+REPORTED <- tag_info[REPORTED, on = "target_tag"]
+cat("Directly reported:", format(nrow(REPORTED), big.mark = ","), "rows\n")
+# Step 3b: Calculate rolled-up values from children
+# Join facts with flat lookup on tag only (lookup is from latest taxonomy, applied to all years)
+setkey(FACTS, tag)
+setkey(FLAT, child_tag)
+MAPPED <- FLAT[FACTS, on = .(child_tag = tag), nomatch = NULL, allow.cartesian = TRUE]
+# Weighted value
+MAPPED[, weighted_val := val * weight]
+# Aggregate: sum weighted values per context + compustat tag
+CALCULATED <- MAPPED[, .(
+  val = sum(weighted_val, na.rm = TRUE),
+  n_children = .N,
+  unit = unit[1]
+), by = .(cik, entity, accn, form, fy, fp, filed, start, end, tax_year, 
+          compustat_name, target_tag)]
+CALCULATED[, source := "calculated"]
+cat("Calculated from children:", format(nrow(CALCULATED), big.mark = ","), "rows\n")
+rm(MAPPED)
+gc(verbose = FALSE)
+# Step 3c: Combine - prefer reported over calculated
+# Create context key for matching
+REPORTED[, ctx := paste(cik, accn, end, compustat_name, sep = "|")]
+CALCULATED[, ctx := paste(cik, accn, end, compustat_name, sep = "|")]
+# Keep calculated only where no reported value exists
+reported_ctx <- unique(REPORTED$ctx)
+CALCULATED_NEW <- CALCULATED[!ctx %chin% reported_ctx]
+cat("Calculated (after removing where reported exists):", format(nrow(CALCULATED_NEW), big.mark = ","), "rows\n")
+# Combine
+REPORTED[, n_children := NA_integer_]
+COMPUSTAT <- rbindlist(list(REPORTED, CALCULATED_NEW), use.names = TRUE, fill = TRUE)
+COMPUSTAT[, ctx := NULL]
+cat("\nFinal result:", format(nrow(COMPUSTAT), big.mark = ","), "rows\n")
+cat("  Reported:", sum(COMPUSTAT$source == "reported"), "\n")
+cat("  Calculated:", sum(COMPUSTAT$source == "calculated"), "\n")
+rm(REPORTED, CALCULATED, CALCULATED_NEW)
+gc(verbose = FALSE)
+```
+
+# Step 4: Save Output
+
+```{r save}
+# Reorder columns
+col_order <- c("cik", "entity", "accn", "form", "fy", "fp", "filed", "start", "end",
+               "tax_year", "compustat_name", "target_tag", "val", "unit", "n_children")
+setcolorder(COMPUSTAT, intersect(col_order, names(COMPUSTAT)))
+output_file <- file.path(params$output_path, "compustat_values.csv")
+fwrite(COMPUSTAT, output_file)
+sz <- file.info(output_file)$size / 1024^2
+cat("\nSaved:", output_file, "\n")
+cat("Size:", round(sz, 1), "MB\n")
+```
+
+# Summary
+
+```{r summary}
+cat("\n=== SUMMARY ===\n")
+cat("\nBy compustat tag:\n")
+print(COMPUSTAT[, .(n = .N, mean_val = mean(val, na.rm = TRUE)), by = compustat_name][order(-n)][1:20])
+cat("\nBy form:\n")
+print(COMPUSTAT[, .N, by = form][order(-N)])
+cat("\nBy fiscal year:\n")
+print(COMPUSTAT[, .N, by = fy][order(fy)])
+```
+

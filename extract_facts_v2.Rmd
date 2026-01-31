@@ -1,0 +1,422 @@
+---
+title: "SEC EDGAR Extraction - Lean Approach"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  mapping_file: "F:/LostInStandardization/compustat_xbrl_mapping.xlsx"
+  taxonomy_path: "F:/LostInStandardization/USGAAP_Taxonomies"
+  companyfacts_zip: "F:/LostInStandardization/bulk_data/companyfacts.zip"
+  output_path: "F:/LostInStandardization/output"
+  max_companies: NULL
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+```
+
+# Configuration
+
+```{r config}
+CONFIG <- list(
+  mapping_file     = params$mapping_file,
+  taxonomy_path    = params$taxonomy_path,
+  companyfacts_zip = params$companyfacts_zip,
+  output_path      = params$output_path,
+  form_types     = c("10-K", "10-K/A", "10-KT", "10-KT/A",
+                     "10-Q", "10-Q/A", "10-QT", "10-QT/A"),
+  min_fy         = 2019L,
+  max_companies  = params$max_companies,
+  output_file = file.path(params$output_path, "extracted_facts.csv")
+)
+dir.create(CONFIG$output_path, showWarnings = FALSE, recursive = TRUE)
+
+# Find the latest taxonomy file in the folder
+tax_files <- list.files(CONFIG$taxonomy_path, pattern = "US_GAAP_Taxonomy_\\d{4}\\.xlsx$", full.names = FALSE)
+tax_years <- as.integer(sub("US_GAAP_Taxonomy_(\\d{4})\\.xlsx", "\\1", tax_files))
+CONFIG$latest_taxonomy_year <- max(tax_years)
+cat("Using latest taxonomy:", CONFIG$latest_taxonomy_year, "\n")
+```
+
+```{r packages}
+library(data.table)
+library(readxl)
+library(jsonlite)
+library(parallel)
+setDTthreads(0)
+# Detect cores
+N_CORES <- max(1L, detectCores() - 1L)
+cat("Using", N_CORES, "cores for parallel processing\n")
+```
+
+# Step 0: Check Existing Data for Incremental Update
+
+```{r check-existing}
+# Load existing accession numbers if output file exists
+EXISTING_ACCNS <- character(0)
+IS_INCREMENTAL <- FALSE
+if (file.exists(CONFIG$output_file)) {
+  cat("Found existing output file. Loading for incremental update...\n")
+  existing <- fread(CONFIG$output_file, select = "accn")
+  EXISTING_ACCNS <- unique(existing$accn)
+  IS_INCREMENTAL <- TRUE
+  cat("  Existing accession numbers:", format(length(EXISTING_ACCNS), big.mark = ","), "\n")
+  rm(existing)
+  gc(verbose = FALSE)
+} else {
+  cat("No existing output file. Will do full extraction.\n")
+}
+```
+
+# Step 1: Load Target Tags from Mapping File
+
+```{r load-mapping}
+mapping <- setDT(read_excel(CONFIG$mapping_file))
+
+# Handle both old format (with definition) and new format (without)
+if (ncol(mapping) >= 3) {
+  setnames(mapping, 1:3, c("compustat_name", "name", "definition"))
+  cat("Target tags:", nrow(mapping), "\n")
+  cat("\nBy statement (definition column present but not used for filtering):\n")
+  print(mapping[, .N, by = definition])
+} else {
+  setnames(mapping, 1:2, c("compustat_name", "name"))
+  cat("Target tags:", nrow(mapping), "\n")
+  cat("(No definition column - will search all statements)\n")
+}
+```
+
+# Step 2: Build Child Tag Lookup from Taxonomies
+
+For each taxonomy year, find all descendants of our target tags.
+**Note**: For each target tag, finds which statements it appears in, then searches
+for children WITHIN each statement separately. This handles companies switching 
+statements over time while avoiding nonsensical cross-statement chains.
+
+```{r build-children-function}
+#' Get all descendants of target tags from a taxonomy year
+#' Returns: data.table with columns (tax_year, target_tag, child_tag, depth, weight)
+#' 
+#' Strategy: For each target, find all statements it appears in, then BFS within
+#' each statement. Union results across statements.
+get_descendants <- function(tax_year, taxonomy_path, target_tags) {
+  
+  fp <- file.path(taxonomy_path, paste0("US_GAAP_Taxonomy_", tax_year, ".xlsx"))
+  if (!file.exists(fp)) {
+    message("  Skipping ", tax_year, " - file not found")
+    return(NULL)
+  }
+  
+  # Load Calculation tab
+  calc <- setDT(read_excel(fp, sheet = "Calculation"))
+  setnames(calc, 
+           old = c("extended link role", "definition", "name", "label", "depth", "weight", "parent"),
+           new = c("link_role", "definition", "element", "label", "depth", "weight", "parent"),
+           skip_absent = TRUE)
+  
+  # Clean parent field and extract definition code
+  calc[, parent := sub("^us-gaap:", "", parent)]
+  calc[, def_code := substr(definition, 1, 6)]
+  
+  results <- list()
+  
+  for (i in seq_len(nrow(target_tags))) {
+    target <- target_tags$name[i]
+    compustat <- target_tags$compustat_name[i]
+    
+    # Find ALL statements where this target appears (as element or parent)
+    target_defs <- unique(c(
+      calc[element == target, def_code],
+      calc[parent == target, def_code]
+    ))
+    
+    if (length(target_defs) == 0) {
+      # Target not found in calc sheet - just return itself
+      descendants <- data.table(
+        child_tag = target,
+        depth_from_target = 0L,
+        weight_path = 1.0
+      )
+    } else {
+      # BFS within EACH statement, then union
+      all_descendants <- list()
+      
+      for (def in target_defs) {
+        calc_def <- calc[def_code == def]
+        
+        desc_def <- data.table(
+          child_tag = target,
+          depth_from_target = 0L,
+          weight_path = 1.0
+        )
+        
+        frontier <- target
+        visited <- target
+        current_depth <- 0L
+        
+        while (length(frontier) > 0) {
+          # Find children WITHIN this statement only
+          children <- calc_def[parent %in% frontier, .(element, parent, weight, depth)]
+          
+          if (nrow(children) == 0) break
+          children <- children[!element %in% visited]
+          if (nrow(children) == 0) break
+          
+          current_depth <- current_depth + 1L
+          
+          new_desc <- data.table(
+            child_tag = children$element,
+            depth_from_target = current_depth,
+            weight_path = children$weight
+          )
+          desc_def <- rbind(desc_def, new_desc)
+          
+          visited <- c(visited, children$element)
+          frontier <- children$element
+        }
+        
+        all_descendants[[def]] <- desc_def
+      }
+      
+      # Union and deduplicate (keep shortest depth if same child in multiple statements)
+      descendants <- rbindlist(all_descendants)
+      descendants <- descendants[, .(
+        depth_from_target = min(depth_from_target),
+        weight_path = weight_path[which.min(depth_from_target)]
+      ), by = child_tag]
+    }
+    
+    # Add metadata
+    descendants[, `:=`(
+      tax_year = tax_year,
+      target_tag = target,
+      compustat_name = compustat
+    )]
+    
+    results[[i]] <- descendants
+  }
+  
+  rbindlist(results)
+}
+```
+
+```{r build-lookup}
+message("Building child tag lookup from latest taxonomy (", CONFIG$latest_taxonomy_year, ")...")
+
+LOOKUP <- get_descendants(CONFIG$latest_taxonomy_year, CONFIG$taxonomy_path, mapping)
+
+# Remove tax_year from lookup - we'll use this for all filings
+LOOKUP[, tax_year := NULL]
+
+cat("\nLookup table built:\n")
+cat("  Total rows:", format(nrow(LOOKUP), big.mark = ","), "\n")
+cat("  Unique child tags:", uniqueN(LOOKUP$child_tag), "\n")
+cat("  Unique target tags:", uniqueN(LOOKUP$target_tag), "\n")
+```
+
+```{r save-lookup}
+# Save lookup for reference
+lookup_file <- file.path(CONFIG$output_path, "tag_lookup.tsv")
+fwrite(LOOKUP, lookup_file, sep = "\t")
+cat("\nSaved lookup to:", lookup_file, "\n")
+```
+
+# Step 3: Get All Unique Tags to Extract
+
+```{r tags-to-extract}
+# All unique tags we need to look for in companyfacts
+ALL_TAGS <- unique(LOOKUP$child_tag)
+cat("Total unique tags to extract:", length(ALL_TAGS), "\n")
+```
+
+# Step 4: Extract Facts from companyfacts.zip
+
+```{r extract-functions}
+#' Assign taxonomy year based on filing date
+get_tax_year <- function(filed) {
+  d <- as.IDate(filed)
+  y <- year(d)
+  m <- month(d)
+  fifelse(m >= 3L, y, y - 1L)
+}
+
+#' Extract relevant facts from one company JSON
+extract_company_facts <- function(zip_path, json_file, tags_to_find, form_types, min_fy, existing_accns = character(0)) {
+  
+  tryCatch({
+    con <- unz(zip_path, json_file, open = "rb")
+    on.exit(close(con))
+    raw <- readBin(con, "raw", n = 50e6)
+    jdata <- fromJSON(rawToChar(raw), simplifyDataFrame = FALSE)
+    
+    cik <- jdata$cik
+    entity <- jdata$entityName
+    usgaap <- jdata$facts$`us-gaap`
+    
+    if (is.null(usgaap)) return(NULL)
+    
+    # Only process tags we care about
+    tags_present <- intersect(names(usgaap), tags_to_find)
+    if (length(tags_present) == 0) return(NULL)
+    
+    # Extract facts for matching tags
+    facts_list <- lapply(tags_present, function(tag) {
+      units <- usgaap[[tag]]$units
+      if (is.null(units)) return(NULL)
+      
+      rbindlist(lapply(names(units), function(u) {
+        vals <- units[[u]]
+        if (length(vals) == 0) return(NULL)
+        
+        dt <- tryCatch(suppressWarnings(rbindlist(vals, fill = TRUE)), error = function(e) NULL)
+        if (is.null(dt) || nrow(dt) == 0) return(NULL)
+        
+        dt[, `:=`(tag = tag, unit = u)]
+        dt
+      }), fill = TRUE)
+    })
+    
+    facts <- rbindlist(facts_list, fill = TRUE)
+    if (is.null(facts) || nrow(facts) == 0) return(NULL)
+    
+    # Add company info
+    facts[, `:=`(cik = cik, entity = entity)]
+    
+    # Filter by form and fiscal year
+    if ("form" %in% names(facts) && "fy" %in% names(facts)) {
+      facts <- facts[form %chin% form_types & fy >= min_fy]
+    }
+    
+    if (nrow(facts) == 0) return(NULL)
+    
+    # Skip already-processed accession numbers (incremental mode)
+    if (length(existing_accns) > 0 && "accn" %in% names(facts)) {
+      facts <- facts[!accn %chin% existing_accns]
+    }
+    
+    if (nrow(facts) == 0) return(NULL)
+    facts
+    
+  }, error = function(e) NULL)
+}
+```
+
+```{r extract-facts}
+# List files in ZIP
+zip_contents <- unzip(CONFIG$companyfacts_zip, list = TRUE)
+json_files <- zip_contents$Name[grepl("^CIK.*\\.json$", zip_contents$Name)]
+
+if (!is.null(CONFIG$max_companies)) {
+  json_files <- head(json_files, CONFIG$max_companies)
+}
+
+n_files <- length(json_files)
+mode_str <- if (IS_INCREMENTAL) "INCREMENTAL" else "FULL"
+cat("Processing", format(n_files, big.mark = ","), "companies (", mode_str, " mode) on", N_CORES, "cores...\n")
+
+# Batch parallel extraction with progress
+t0 <- Sys.time()
+batch_size <- N_CORES * 50  # Process 50 files per core per batch
+n_batches <- ceiling(n_files / batch_size)
+bar_width <- 50
+
+results <- vector("list", n_files)
+
+if (.Platform$OS.type == "windows") {
+  cl <- makeCluster(N_CORES)
+  clusterExport(cl, c("CONFIG", "ALL_TAGS", "EXISTING_ACCNS", "extract_company_facts"))
+  invisible(clusterEvalQ(cl, { library(data.table); library(jsonlite) }))
+}
+
+for (b in seq_len(n_batches)) {
+  start_i <- (b - 1L) * batch_size + 1L
+  end_i <- min(b * batch_size, n_files)
+  batch_files <- json_files[start_i:end_i]
+  
+  if (.Platform$OS.type == "windows") {
+    batch_results <- parLapply(cl, batch_files, function(jf) {
+      extract_company_facts(CONFIG$companyfacts_zip, jf, ALL_TAGS, 
+                            CONFIG$form_types, CONFIG$min_fy, EXISTING_ACCNS)
+    })
+  } else {
+    batch_results <- mclapply(batch_files, function(jf) {
+      extract_company_facts(CONFIG$companyfacts_zip, jf, ALL_TAGS, 
+                            CONFIG$form_types, CONFIG$min_fy, EXISTING_ACCNS)
+    }, mc.cores = N_CORES)
+  }
+  
+  results[start_i:end_i] <- batch_results
+  
+  # Progress bar
+  pct <- round(100 * end_i / n_files)
+  filled <- round(bar_width * end_i / n_files)
+  bar <- paste0("[", strrep("=", filled), strrep(" ", bar_width - filled), "]")
+  elapsed <- round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1)
+  cat("\r", bar, " ", pct, "% (", end_i, "/", n_files, ") ", elapsed, " min", sep = "")
+  flush.console()
+}
+
+if (.Platform$OS.type == "windows") {
+  stopCluster(cl)
+}
+
+cat("\n")
+
+# Combine
+FACTS <- rbindlist(results[!sapply(results, is.null)], fill = TRUE)
+
+cat("\nExtracted facts:\n")
+cat("  Rows:", format(nrow(FACTS), big.mark = ","), "\n")
+cat("  Companies:", uniqueN(FACTS$cik), "\n")
+cat("  Unique tags:", uniqueN(FACTS$tag), "\n")
+```
+
+# Step 5: Save Output (Append if Incremental)
+
+Raw extracted facts saved here. The lookup table (`tag_lookup_by_year.tsv`) contains the mapping logic to roll up to compustat tags - apply separately to avoid memory issues.
+
+```{r save-output}
+# Add taxonomy year to facts
+FACTS[, tax_year := pmax(2019L, pmin(2026L, get_tax_year(filed)))]
+
+# Select columns for output
+output_cols <- c("cik", "entity", "accn", "form", "fy", "fp", "filed", 
+                 "start", "end", "val", "unit", "tag", "tax_year")
+
+out <- FACTS[, intersect(output_cols, names(FACTS)), with = FALSE]
+
+if (nrow(out) == 0) {
+  cat("\nNo new facts to save.\n")
+} else if (IS_INCREMENTAL) {
+  # Append to existing file
+  fwrite(out, CONFIG$output_file, append = TRUE)
+  
+  cat("\nAppended to:", CONFIG$output_file, "\n")
+  cat("New rows added:", format(nrow(out), big.mark = ","), "\n")
+} else {
+  # Write new file
+  fwrite(out, CONFIG$output_file)
+  
+  sz <- file.info(CONFIG$output_file)$size / 1024^2
+  cat("\nSaved:", CONFIG$output_file, "\n")
+  cat("Size:", round(sz, 1), "MB\n")
+  cat("Rows:", format(nrow(out), big.mark = ","), "\n")
+}
+```
+
+# Summary
+
+```{r summary}
+cat("\n=== SUMMARY ===\n")
+
+cat("\nFacts by tag (top 20):\n")
+print(out[, .N, by = tag][order(-N)][1:20])
+
+cat("\nFacts by form:\n")
+print(out[, .N, by = form][order(-N)])
+
+cat("\nFacts by fiscal year:\n")
+print(out[, .N, by = fy][order(fy)])
+```
+
+
+
