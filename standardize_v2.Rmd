@@ -1,0 +1,462 @@
+---
+title: "Standardize to Quarterly/Annual Values"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  input_file: "F:/LostInStandardization/output/compustat_values.csv"
+  output_path: "F:/LostInStandardization/output"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+```
+
+# Overview
+
+- Filter to 10-K and 10-Q only (no amendments)
+- Keep one value per company/tag/period (Q1, Q2, Q3, Q4/FY)
+- For income statement and cash flow:
+  - Detect YTD vs quarterly by duration (end - start): Q2 >150 days = YTD
+  - YTD: Q2_actual = Q2 - Q1, Q3_actual = Q3 - Q2, Q4 = Y - Q3
+  - Quarterly: Q1-Q3 as reported, Q4 = Y - (Q1 + Q2 + Q3)
+- Balance sheet: point-in-time, Q4 = Y (same value at fiscal year end)
+
+```{r packages}
+library(data.table)
+setDTthreads(0)
+```
+
+# Step 1: Load Data
+
+```{r load}
+DT <- fread(params$input_file)
+cat("Loaded:", format(nrow(DT), big.mark = ","), "rows\n")
+cat("Columns:", paste(names(DT), collapse = ", "), "\n")
+cat("\nBy form:\n")
+print(DT[, .N, by = form][order(-N)])
+cat("\nBy fp (fiscal period):\n")
+print(DT[, .N, by = fp][order(fp)])
+```
+
+# Step 2: Filter to 10-K and 10-Q Only
+
+```{r filter-forms}
+# Keep only base 10-K and 10-Q (no amendments)
+DT <- DT[form %chin% c("10-K", "10-Q")]
+cat("After filtering to 10-K/10-Q:\n")
+cat("  Rows:", format(nrow(DT), big.mark = ","), "\n")
+print(DT[, .N, by = form])
+```
+
+# Step 3: Identify Statement Types
+
+```{r statement-types}
+# Classify by compustat variable name per Table IA.4 from "Lost in Standardization"
+# BS = Balance Sheet (point-in-time)
+# IS = Income Statement (quarterly values from 10-Q, need Q4 calc from annual)
+# CF = Cash Flow (quarterly values from 10-Q, need Q4 calc from annual)
+
+# Balance sheet items (point-in-time values) - 32 vars
+BS_VARS <- c(
+  # Assets
+  "AT", "ACT", "CHE", "CH", "IVST", "RECT", "INVT", "XPP",
+  "PPENT", "PPEGT", "DPACT", "IVAEQ", "INTANO", "GDWL",
+  # Liabilities
+  "LT", "LCT", "DLC", "DD1", "NP", "AP", "TXP", "XACC", "DLTT", "TXDB", "ITCB",
+  # Equity
+  "TEQ", "SEQ", "CSTK", "RE", "PSTK", "MIBN",
+  # Additional
+ "CSHO"
+)
+
+# Income statement items (quarterly flow values, Q4 = Y - Q1 - Q2 - Q3) - 13 vars
+IS_VARS <- c(
+  "SALE", "COGS", "XSGA", "XRD", "XAD",
+  "DP", "AM", "OIADP", "XINT", "PI", "TXT", "IB",
+  # Additional
+ "EPSPX"
+)
+
+# Cash flow items (quarterly flow values, Q4 = Y - Q1 - Q2 - Q3) - 17 vars
+CF_VARS <- c(
+  # Operating
+  "OANCF", "IBC", "OPCAPCH", "RECCH", "INVCH", "TXACH", "APALCH", "DPC", "XIDOC",
+  # Investing
+  "IVNCF", "CAPX", "SPPE", "AQC",
+  # Financing
+  "FINCF", "SSTK", "PRSTKC", "DV"
+)
+
+DT[, stmt_type := fcase(
+  compustat_name %chin% BS_VARS, "BS",
+  compustat_name %chin% IS_VARS, "IS",
+  compustat_name %chin% CF_VARS, "CF",
+  default = "OTHER"
+)]
+
+cat("Statement types:\n")
+print(DT[, .N, by = stmt_type])
+
+# Check for any OTHER (unclassified)
+other_vars <- unique(DT[stmt_type == "OTHER", compustat_name])
+if (length(other_vars) > 0) {
+  cat("\nWARNING: Unclassified variables:", paste(other_vars, collapse = ", "), "\n")
+}
+```
+
+# Step 4: Standardize Fiscal Period
+
+```{r standardize-fp}
+# Map fp to standard quarters
+# FY = annual (from 10-K)
+# Q1, Q2, Q3, Q4 = quarters (from 10-Q, though Q4 often comes from 10-K)
+DT[, period := fcase(
+  fp == "FY", "Y",
+  fp == "Q1", "Q1",
+  fp == "Q2", "Q2",
+  fp == "Q3", "Q3",
+  fp == "Q4", "Q4",
+  default = NA_character_
+)]
+# Remove rows with non-standard periods
+DT <- DT[!is.na(period)]
+cat("After standardizing periods:\n")
+print(DT[, .N, by = period][order(period)])
+```
+
+# Step 5: Deduplicate - One Value per Company/Tag/Period/Year
+
+```{r dedup}
+# Sort by filed date descending - keep most recent filing
+setorder(DT, cik, fy, compustat_name, period, -filed)
+# Keep first (most recent) per group
+DT <- DT[, .SD[1], by = .(cik, fy, compustat_name, period)]
+cat("After deduplication:", format(nrow(DT), big.mark = ","), "rows\n")
+```
+
+# Step 6: Calculate Quarterly Values
+
+For IS and CF, we detect reporting type by duration (end - start):
+- **Quarterly**: Q2 duration ~90 days → use as-is, Q4 = Y - (Q1 + Q2 + Q3)
+- **YTD**: Q2 duration ~180 days → subtract prior periods
+
+```{r calc-quarterly}
+# Only IS and CF need adjustment
+FLOW_TYPES <- c("IS", "CF")
+BS <- DT[stmt_type == "BS"]
+FLOW <- DT[stmt_type %chin% FLOW_TYPES]
+
+cat("Balance sheet rows (no adjustment):", format(nrow(BS), big.mark = ","), "\n")
+cat("Flow statement rows:", format(nrow(FLOW), big.mark = ","), "\n")
+
+if (nrow(FLOW) > 0) {
+  # Calculate duration for each row
+  FLOW[, duration := as.integer(end - start)]
+  
+  # Create wide format with values
+  FLOW_WIDE <- dcast(
+    FLOW,
+    cik + entity + fy + compustat_name + target_tag + stmt_type + unit ~ period,
+    value.var = "val",
+    fun.aggregate = function(x) x[1]
+  )
+  
+  # Also get durations to detect YTD vs quarterly
+  DUR_WIDE <- dcast(
+    FLOW,
+    cik + entity + fy + compustat_name + target_tag + stmt_type + unit ~ period,
+    value.var = "duration",
+    fun.aggregate = function(x) x[1]
+  )
+  setnames(DUR_WIDE, c("Q1", "Q2", "Q3", "Q4", "Y"), 
+           c("dur_Q1", "dur_Q2", "dur_Q3", "dur_Q4", "dur_Y"), skip_absent = TRUE)
+  
+  # Merge durations
+  merge_cols <- c("cik", "entity", "fy", "compustat_name", "target_tag", "stmt_type", "unit")
+  FLOW_WIDE <- DUR_WIDE[FLOW_WIDE, on = merge_cols]
+  
+  # Ensure all columns exist
+  for (col in c("Q1", "Q2", "Q3", "Q4", "Y")) {
+    if (!col %in% names(FLOW_WIDE)) FLOW_WIDE[, (col) := NA_real_]
+  }
+  for (col in c("dur_Q1", "dur_Q2", "dur_Q3", "dur_Q4", "dur_Y")) {
+    if (!col %in% names(FLOW_WIDE)) FLOW_WIDE[, (col) := NA_integer_]
+  }
+  
+  # Cast filed dates
+  FLOW_FILED <- FLOW[, .(filed = max(filed, na.rm = TRUE)), 
+                      by = .(cik, entity, fy, compustat_name, target_tag, stmt_type, unit, period)]
+  FILED_WIDE <- dcast(
+    FLOW_FILED,
+    cik + entity + fy + compustat_name + target_tag + stmt_type + unit ~ period,
+    value.var = "filed",
+    fun.aggregate = function(x) max(x, na.rm = TRUE)
+  )
+  for (col in c("Q1", "Q2", "Q3", "Q4", "Y")) {
+    if (!col %in% names(FILED_WIDE)) FILED_WIDE[, (col) := as.IDate(NA)]
+  }
+  setnames(FILED_WIDE, c("Q1", "Q2", "Q3", "Q4", "Y"), 
+           c("filed_Q1", "filed_Q2", "filed_Q3", "filed_Q4", "filed_Y"))
+  FLOW_WIDE <- FILED_WIDE[FLOW_WIDE, on = merge_cols]
+  
+  # Detect YTD vs Quarterly based on duration
+  # YTD: Q2 > 150 days (~6 months), Q3 > 240 days (~9 months)
+  # Quarterly: Q2 < 120 days (single quarter)
+  FLOW_WIDE[, is_ytd := fifelse(
+    !is.na(dur_Q2) & dur_Q2 > 150, TRUE,
+    fifelse(!is.na(dur_Q3) & dur_Q3 > 240, TRUE, FALSE)
+  )]
+  
+  cat("\nReporting type detection (by duration):\n")
+  cat("  YTD variable-rows:", sum(FLOW_WIDE$is_ytd, na.rm = TRUE), "\n")
+  cat("  Quarterly variable-rows:", sum(!FLOW_WIDE$is_ytd, na.rm = TRUE), "\n")
+  
+  # Show which compustat_names are mostly YTD vs quarterly
+  ytd_summary <- FLOW_WIDE[, .(
+    n_ytd = sum(is_ytd, na.rm = TRUE),
+    n_qtr = sum(!is_ytd, na.rm = TRUE),
+    avg_dur_Q2 = mean(dur_Q2, na.rm = TRUE)
+  ), by = compustat_name][order(-n_ytd)]
+  
+  cat("\nVariables detected as mostly YTD (n_ytd > n_qtr):\n")
+  ytd_vars <- ytd_summary[n_ytd > n_qtr, compustat_name]
+  if (length(ytd_vars) > 0) {
+    print(ytd_summary[n_ytd > n_qtr])
+  } else {
+    cat("  (none)\n")
+  }
+  
+  # Calculate actual quarterly values
+  FLOW_WIDE[, `:=`(
+    # Q1 always as-reported
+    Q1_val = Q1,
+    
+    # Q2: if YTD, subtract Q1; else as-is
+    Q2_val = fifelse(is_ytd & !is.na(Q2) & !is.na(Q1), Q2 - Q1, Q2),
+    
+    # Q3: if YTD, subtract Q2_ytd; else as-is  
+    Q3_val = fifelse(is_ytd & !is.na(Q3) & !is.na(Q2), Q3 - Q2, Q3),
+    
+    # Q4: if YTD, Y - Q3_ytd; if quarterly, Y - (Q1 + Q2 + Q3)
+    Q4_val = fifelse(
+      is_ytd & !is.na(Y) & !is.na(Q3),
+      Y - Q3,  # YTD: subtract cumulative Q3
+      fifelse(
+        !is_ytd & !is.na(Y) & !is.na(Q1) & !is.na(Q2) & !is.na(Q3),
+        Y - Q1 - Q2 - Q3,  # Quarterly: subtract sum
+        NA_real_
+      )
+    ),
+    
+    # Y as-is
+    Y_val = Y
+  )]
+  
+  cat("\nQ4 calculation summary:\n")
+  cat("  YTD with Y and Q3:", sum(FLOW_WIDE$is_ytd & !is.na(FLOW_WIDE$Y) & !is.na(FLOW_WIDE$Q3)), "\n")
+  cat("  Quarterly with Y and Q1-Q3:", sum(!FLOW_WIDE$is_ytd & !is.na(FLOW_WIDE$Y) & 
+      !is.na(FLOW_WIDE$Q1) & !is.na(FLOW_WIDE$Q2) & !is.na(FLOW_WIDE$Q3)), "\n")
+  cat("  Total with calculated Q4:", sum(!is.na(FLOW_WIDE$Q4_val)), "\n")
+  
+  # Use Y's filed date for Q4
+  FLOW_WIDE[, filed_Q4 := fifelse(!is.na(Q4_val) & is.na(filed_Q4), filed_Y, filed_Q4)]
+  
+  # Clean up temp columns
+  FLOW_WIDE[, c("dur_Q1", "dur_Q2", "dur_Q3", "dur_Q4", "dur_Y", "is_ytd") := NULL]
+  
+  # Melt back to long
+  FLOW_CALC <- melt(
+    FLOW_WIDE,
+    id.vars = c("cik", "entity", "fy", "compustat_name", "target_tag", "stmt_type", "unit",
+                "filed_Q1", "filed_Q2", "filed_Q3", "filed_Q4", "filed_Y"),
+    measure.vars = c("Q1_val", "Q2_val", "Q3_val", "Q4_val", "Y_val"),
+    variable.name = "period",
+    value.name = "val"
+  )
+  
+  # Clean period names
+  FLOW_CALC[, period := sub("_val$", "", period)]
+  # Get corresponding filed date
+  FLOW_CALC[, filed := fcase(
+    period == "Q1", filed_Q1,
+    period == "Q2", filed_Q2,
+    period == "Q3", filed_Q3,
+    period == "Q4", filed_Q4,
+    period == "Y", filed_Y
+  )]
+  # Drop the individual filed columns
+  FLOW_CALC[, c("filed_Q1", "filed_Q2", "filed_Q3", "filed_Q4", "filed_Y") := NULL]
+  # Remove NA values
+  FLOW_CALC <- FLOW_CALC[!is.na(val)]
+  cat("\nFlow statements after quarterly calc:", format(nrow(FLOW_CALC), big.mark = ","), "\n")
+} else {
+  FLOW_CALC <- data.table()
+}
+# BS keeps original values, just need matching columns
+BS_OUT <- BS[, .(cik, entity, fy, compustat_name, target_tag, stmt_type, unit, period, val, filed)]
+# Combine
+FINAL <- rbindlist(list(BS_OUT, FLOW_CALC), use.names = TRUE, fill = TRUE)
+cat("\nFinal dataset:", format(nrow(FINAL), big.mark = ","), "rows\n")
+```
+
+# Step 7: Save Output
+
+```{r save}
+# Order columns nicely
+setcolorder(FINAL, c("cik", "entity", "fy", "period", "filed", "compustat_name", "target_tag", 
+                      "stmt_type", "val", "unit"))
+# Sort
+setorder(FINAL, cik, fy, period, compustat_name)
+output_file <- file.path(params$output_path, "compustat_quarterly.csv")
+fwrite(FINAL, output_file)
+sz <- file.info(output_file)$size / 1024^2
+cat("\nSaved:", output_file, "\n")
+cat("Size:", round(sz, 1), "MB\n")
+```
+
+# Step 8: Create Quarterly and Annual Dataframes
+
+```{r create-dataframes}
+# For IS/CF: Q4 was calculated as Y - (Q1 + Q2 + Q3) in Step 6
+# For BS/OTHER: Q4 = Y (same point-in-time value at fiscal year end)
+
+# Separate flow (IS/CF) and stock (BS/OTHER) data
+FLOW_DATA <- FINAL[stmt_type %chin% c("IS", "CF")]
+STOCK_DATA <- FINAL[stmt_type %chin% c("BS", "OTHER")]
+
+cat("Flow statement rows (IS/CF):", format(nrow(FLOW_DATA), big.mark = ","), "\n")
+cat("Stock/point-in-time rows (BS/OTHER):", format(nrow(STOCK_DATA), big.mark = ","), "\n")
+
+# For BS/OTHER: create Q4 by copying Y values
+STOCK_Y <- STOCK_DATA[period == "Y"]
+STOCK_Q4 <- copy(STOCK_Y)
+STOCK_Q4[, period := "Q4"]
+
+# Combine stock data: Q1-Q3 as reported, Q4 = Y value
+STOCK_QDATA <- rbindlist(list(
+  STOCK_DATA[period %in% c("Q1", "Q2", "Q3")],
+  STOCK_Q4
+), fill = TRUE)
+
+# Flow data already has calculated Q4
+FLOW_QDATA <- FLOW_DATA[period %in% c("Q1", "Q2", "Q3", "Q4")]
+
+# Combine all quarterly
+QDATA <- rbindlist(list(STOCK_QDATA, FLOW_QDATA), fill = TRUE)
+
+# Annual data (Y period)
+YDATA <- FINAL[period == "Y"]
+
+cat("\nQuarterly rows (Q1-Q4):", format(nrow(QDATA), big.mark = ","), "\n")
+cat("  BS/OTHER:", nrow(STOCK_QDATA), "\n")
+cat("  IS/CF:", nrow(FLOW_QDATA), "\n")
+cat("Annual rows (Y):", format(nrow(YDATA), big.mark = ","), "\n")
+
+# QDATA_ALL for downstream use
+QDATA_ALL <- copy(QDATA)
+setorder(QDATA_ALL, cik, fy, period)
+cat("\nTotal quarterly rows:", format(nrow(QDATA_ALL), big.mark = ","), "\n")
+```
+
+```{r widen-quarterly}
+# Create var names (lowercase, no underscore: atq, ltq, saleq)
+QDATA_ALL[, var_name := paste0(tolower(compustat_name), "q")]
+# Get one filing date per cik/fy/period (max)
+RDQ_Q <- QDATA_ALL[, .(rdq = max(filed, na.rm = TRUE)), by = .(cik, fy, period)]
+# Cast to wide
+WIDE_Q <- dcast(
+  QDATA_ALL,
+  cik + entity + fy + period ~ var_name,
+  value.var = "val",
+  fun.aggregate = function(x) x[1]
+)
+# Add rdq
+WIDE_Q <- RDQ_Q[WIDE_Q, on = .(cik, fy, period)]
+# Sort columns: id cols first, then var cols alphabetically
+id_cols <- c("cik", "entity", "fy", "period", "rdq")
+var_cols <- sort(setdiff(names(WIDE_Q), id_cols))
+setcolorder(WIDE_Q, c(id_cols, var_cols))
+setorder(WIDE_Q, cik, fy, period)
+cat("\nQuarterly wide format:\n")
+cat("  Rows:", format(nrow(WIDE_Q), big.mark = ","), "\n")
+cat("  Columns:", ncol(WIDE_Q), "\n")
+# Save
+q_file <- file.path(params$output_path, "compustat_quarterly_wide.csv")
+fwrite(WIDE_Q, q_file)
+cat("Saved:", q_file, "\n")
+```
+
+```{r widen-annual}
+# Create var names (lowercase, no underscore: aty, lty, saley)
+YDATA[, var_name := paste0(tolower(compustat_name), "y")]
+# Get one filing date per cik/fy (max)
+RDQ_Y <- YDATA[, .(rdq = max(filed, na.rm = TRUE)), by = .(cik, fy)]
+# Cast to wide
+WIDE_Y <- dcast(
+  YDATA,
+  cik + entity + fy ~ var_name,
+  value.var = "val",
+  fun.aggregate = function(x) x[1]
+)
+# Add rdq
+WIDE_Y <- RDQ_Y[WIDE_Y, on = .(cik, fy)]
+# Sort columns
+id_cols <- c("cik", "entity", "fy", "rdq")
+var_cols <- sort(setdiff(names(WIDE_Y), id_cols))
+setcolorder(WIDE_Y, c(id_cols, var_cols))
+setorder(WIDE_Y, cik, fy)
+cat("\nAnnual wide format:\n")
+cat("  Rows:", format(nrow(WIDE_Y), big.mark = ","), "\n")
+cat("  Columns:", ncol(WIDE_Y), "\n")
+# Save
+y_file <- file.path(params$output_path, "compustat_annual_wide.csv")
+fwrite(WIDE_Y, y_file)
+cat("Saved:", y_file, "\n")
+```
+
+# Summary
+
+```{r summary}
+cat("\n=== SUMMARY ===\n")
+cat("\nBy period:\n")
+print(FINAL[, .N, by = period][order(period)])
+cat("\nBy statement type:\n")
+print(FINAL[, .N, by = stmt_type])
+cat("\nBy fiscal year:\n")
+print(FINAL[, .N, by = fy][order(fy)])
+cat("\nCompanies:", uniqueN(FINAL$cik), "\n")
+cat("Compustat tags:", uniqueN(FINAL$compustat_name), "\n")
+cat("\nSample values:\n")
+print(FINAL[cik == 4977 & fy == 2025])
+```
+
+```{r}
+WIDE_Y[cik %in% 320193]
+```
+
+```{r}
+WIDE_Q[cik %in% 320193]
+```
+
+```{r}
+plot(WIDE_Q[cik %in% 320193]$ibq)
+```
+
+
+```{r q4-verification}
+# Verify Q4 calculation: Q4 should equal Y - (Q1 + Q2 + Q3)
+cat("\n=== Q4 CALCULATION VERIFICATION ===\n")
+cat("Example: Apple (CIK 320193) COGS\n")
+aapl_cogs <- QDATA_ALL[cik == 320193 & compustat_name == "COGS", .(fy, period, val)]
+aapl_cogs_wide <- dcast(aapl_cogs, fy ~ period, value.var = "val")
+if (nrow(aapl_cogs_wide) > 0) {
+  aapl_cogs_wide[, q123_sum := Q1 + Q2 + Q3]
+  aapl_cogs_wide[, expected_Q4 := YDATA[cik == 320193 & compustat_name == "COGS", .(fy, val)][aapl_cogs_wide, on = "fy", val] - q123_sum]
+  print(aapl_cogs_wide[order(-fy)][1:5])
+}
+```
+
+```{r}
+DT[cik %in% 320193 & target_tag %in% "ProfitLoss"]
+```
+
