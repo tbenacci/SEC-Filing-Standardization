@@ -1,0 +1,339 @@
+---
+title: "Add YTD Variables and Compustat Aliases"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+```
+
+# Overview
+
+1. Create aliases for Compustat variable names that differ from our XBRL mapping
+2. Create YTD cumulative variables for cash flow items (oancfy, capxy, ivncfy)
+3. Check availability of requested Compustat funda columns
+4. Rename identifier columns: `fy` -> `fyearq`, `period` -> `fqtr` (remove "Q", values become 1/2/3/4)
+
+```{r packages}
+library(data.table)
+setDTthreads(0)
+```
+
+## Step 1: Load Data
+
+```{r load}
+wide_q <- fread(
+  "F:/LostInStandardization/output/compustat_quarterly_wide.csv"
+)
+cat("Loaded:", format(nrow(wide_q), big.mark = ","), "rows\n")
+cat("Columns:", ncol(wide_q), "\n")
+```
+
+## Step 2: Define Target Columns
+
+```{r target-cols}
+# Compustat funda columns we want to match
+funda_cols <- c(
+  "cshoq", "prccq", "ceqq", "seqq", "epspxq", "dlttq", "atq",
+  "niq", "saleq", "oibdpq", "cogsq", "piq", "oancfy", "icaptq", "revtq",
+  "actq", "lctq", "invtq", "dlcq", "cheq", "rectq", "apq",
+  "mibq", "pstkq", "capxy", "dvpq", "ivncfy"
+)
+cat("Target columns:", length(funda_cols), "\n")
+```
+
+## Step 3: Create Aliases
+
+Map our XBRL-derived column names to Compustat equivalents.
+
+```{r aliases}
+# niq = ibq (Net Income = Income Before Extraordinary Items)
+if ("ibq" %in% names(wide_q)) {
+  wide_q[, niq := ibq]
+  cat("  niq = ibq\n")
+}
+# revtq = saleq (Total Revenue = Sales)
+if ("saleq" %in% names(wide_q)) {
+  wide_q[, revtq := saleq]
+  cat("  revtq = saleq\n")
+}
+# mibq = mibnq (Minority Interest)
+if ("mibnq" %in% names(wide_q)) {
+  wide_q[, mibq := mibnq]
+  cat("  mibq = mibnq\n")
+}
+# dpq fallback: if dpq missing, use dpcq (Depreciation from Cash Flow statement)
+if (!"dpq" %in% names(wide_q) && "dpcq" %in% names(wide_q)) {
+  wide_q[, dpq := dpcq]
+  cat("  dpq = dpcq (fallback)\n")
+} else if ("dpq" %in% names(wide_q)) {
+  # Fill NA values in dpq with dpcq where available
+  if ("dpcq" %in% names(wide_q)) {
+    wide_q[is.na(dpq), dpq := dpcq]
+    cat("  dpq: filled NAs with dpcq\n")
+  }
+}
+# ceqq = seqq - pstkq (Common Equity = Stockholders Equity - Preferred Stock)
+if ("seqq" %in% names(wide_q) && "pstkq" %in% names(wide_q)) {
+  wide_q[, ceqq := seqq - fifelse(is.na(pstkq), 0, pstkq)]
+  cat("  ceqq = seqq - pstkq\n")
+} else if ("seqq" %in% names(wide_q)) {
+  wide_q[, ceqq := seqq]
+  cat("  ceqq = seqq (no pstkq)\n")
+}
+# oibdpq = oiadpq + dpq (Operating Income Before Depreciation)
+if ("oiadpq" %in% names(wide_q) && "dpq" %in% names(wide_q)) {
+  wide_q[, oibdpq := oiadpq + fifelse(is.na(dpq), 0, dpq)]
+  cat("  oibdpq = oiadpq + dpq\n")
+}
+# icaptq = Invested Capital = dlttq + dlcq + seqq
+if ("dlttq" %in% names(wide_q) && "dlcq" %in% names(wide_q) && "seqq" %in% names(wide_q)) {
+  wide_q[, icaptq := fifelse(is.na(dlttq), 0, dlttq) + 
+                     fifelse(is.na(dlcq), 0, dlcq) + 
+                     fifelse(is.na(seqq), 0, seqq)]
+  cat("  icaptq = dlttq + dlcq + seqq\n")
+}
+# dvpq = Preferred Dividends (typically 0; XBRL reports total dividends)
+if ("dvq" %in% names(wide_q) && !"dvpq" %in% names(wide_q)) {
+  wide_q[, dvpq := 0]
+  cat("  dvpq = 0 (preferred dividends not separated in XBRL)\n")
+}
+cat("\nAliases created.\n")
+```
+
+## Step 4: Create YTD Cumulative Variables
+
+Compustat quarterly reports some cash flow items as YTD cumulative. Create these from our quarterly values.
+
+```{r ytd-vars}
+cat("Creating YTD cumulative variables...\n\n")
+
+# YTD variable mappings: ytd_name -> quarterly_source
+ytd_mapping <- list(
+  oancfy = "oancfq",
+  capxy = "capxq",
+  ivncfy = "ivncfq"
+)
+
+# Sort for cumsum
+setorder(wide_q, cik, fy, period)
+wide_q[, period_num := match(period, c("Q1", "Q2", "Q3", "Q4"))]
+
+for (ycol in names(ytd_mapping)) {
+  qcol <- ytd_mapping[[ycol]]
+  
+  if (qcol %in% names(wide_q)) {
+    # Cumulative sum within each cik/fy, ordered by period
+    wide_q[order(period_num), (ycol) := cumsum(fifelse(is.na(get(qcol)), 0, get(qcol))), by = .(cik, fy)]
+    cat(sprintf("  %s = cumsum(%s): %d values\n", ycol, qcol, sum(!is.na(wide_q[[ycol]]))))
+  } else {
+    cat(sprintf("  SKIPPED %s - %s not found\n", ycol, qcol))
+  }
+}
+
+# Clean up
+wide_q[, period_num := NULL]
+
+cat("\nYTD variables created.\n")
+```
+
+## Step 5: Check Column Availability
+
+```{r check-cols}
+available <- funda_cols[funda_cols %in% names(wide_q)]
+missing <- funda_cols[!funda_cols %in% names(wide_q)]
+cat("AVAILABLE (", length(available), "/", length(funda_cols), "):\n")
+cat(paste(available, collapse = ", "), "\n")
+cat("\nMISSING (", length(missing), "):\n")
+if (length(missing) > 0) {
+  cat(paste(missing, collapse = ", "), "\n")
+  cat("\nNote:\n")
+  if ("prccq" %in% missing) cat("prccq is quarter observed stock price, not in XBRL, get from CRSP\n")
+} else {
+  cat("None - all columns available!\n")
+}
+```
+
+## Step 6: Verify YTD Calculation
+
+```{r verify}
+cat("Sample: Apple FY2024 YTD values\n\n")
+
+cols_to_show <- c("cik", "fy", "period", "oancfq", "oancfy", "capxq", "capxy", "ivncfq", "ivncfy")
+cols_exist <- cols_to_show[cols_to_show %in% names(wide_q)]
+
+aapl <- wide_q[cik == 320193 & fy == 2024, ..cols_exist]
+if (nrow(aapl) > 0) {
+  print(aapl)
+  
+  if ("oancfq" %in% names(aapl) && "oancfy" %in% names(aapl)) {
+    cat("\nVerification (Q4 YTD should = sum of Q1:Q4):\n")
+    oancf_sum <- sum(aapl$oancfq, na.rm = TRUE)
+    oancf_q4_ytd <- aapl[period == "Q4", oancfy]
+    cat(sprintf("  OANCF: sum(Q1:Q4) = %.2f, Q4_YTD = %.2f\n", oancf_sum, oancf_q4_ytd))
+  }
+} else {
+  cat("No Apple data found for FY2024\n")
+}
+```
+
+## Step 7: Rename Columns to Match Compustat
+
+```{r rename-cols}
+cat("Renaming columns to match Compustat conventions...\n\n")
+# fy -> fyearq (fiscal year)
+if ("fy" %in% names(wide_q)) {
+  setnames(wide_q, "fy", "fyearq")
+  cat("  fy -> fyearq\n")
+}
+# entity -> conm (company name)
+if ("entity" %in% names(wide_q)) {
+  setnames(wide_q, "entity", "conm")
+  cat("  entity -> conm\n")
+}
+# period -> fqtr (fiscal quarter), convert Q1/Q2/Q3/Q4 to 1/2/3/4
+if ("period" %in% names(wide_q)) {
+  wide_q[, fqtr := as.integer(gsub("Q", "", period))]
+  wide_q[, period := NULL]
+  cat("  period -> fqtr (Q1->1, Q2->2, Q3->3, Q4->4)\n")
+}
+```
+
+## Summary
+
+```{r summary}
+cat("\nColumn availability:", length(available), "/", length(funda_cols), "\n")
+if (length(missing) > 0) {
+  cat("Missing:", paste(missing, collapse = ", "), "\n")
+}
+cat("\nColumn Names:", colnames(wide_q))
+```
+
+# Compustat Data
+
+```{r load-compustat}
+compustat <- fread(
+  "F:/CRSP/fundamental_quarterly_196103_202504.csv"
+)
+cat("Loaded:", format(nrow(compustat), big.mark = ","), "rows\n")
+cat("Columns:", ncol(compustat), "\n")
+```
+
+## Filter Both Datasets to Same Columns
+
+```{r filter-both}
+# Define columns to keep
+# ID columns
+id_cols <- c("cik", "conm", "fyearq", "fqtr", "rdq")
+
+# Data columns: funda_cols minus prccq (not in XBRL)
+data_cols <- setdiff(funda_cols, "prccq")
+
+# All target columns
+target_cols <- c(id_cols, data_cols)
+
+cat("Target columns:\n")
+cat("  ID columns:", paste(id_cols, collapse = ", "), "\n")
+cat("  Data columns (", length(data_cols), "):", paste(data_cols, collapse = ", "), "\n")
+cat("  Total target:", length(target_cols), "\n")
+
+# Check availability in each dataset
+in_wide_q <- target_cols[target_cols %in% names(wide_q)]
+in_compustat <- target_cols[target_cols %in% names(compustat)]
+
+cat("\nAvailable:\n")
+cat("  wide_q:", length(in_wide_q), "/", length(target_cols), "\n")
+cat("  compustat:", length(in_compustat), "/", length(target_cols), "\n")
+
+# Report missing
+missing_wide_q <- setdiff(target_cols, names(wide_q))
+missing_compustat <- setdiff(target_cols, names(compustat))
+
+if (length(missing_wide_q) > 0) {
+  cat("\nMissing from wide_q:", paste(missing_wide_q, collapse = ", "), "\n")
+}
+if (length(missing_compustat) > 0) {
+  cat("\nMissing from compustat:", paste(missing_compustat, collapse = ", "), "\n")
+}
+
+# Final columns: only those present in BOTH datasets
+final_cols <- target_cols[target_cols %in% names(wide_q) & target_cols %in% names(compustat)]
+cat("\nFinal columns (in both):", length(final_cols), "\n")
+
+# Filter both datasets to keep only final_cols, in same order
+wide_q <- wide_q[, ..final_cols]
+compustat <- compustat[, ..final_cols]
+
+# Sort both datasets
+setorder(wide_q, cik, fyearq, fqtr)
+setorder(compustat, cik, fyearq, fqtr)
+
+cat("\nAfter filtering:\n")
+cat("  wide_q:", format(nrow(wide_q), big.mark = ","), "rows x", ncol(wide_q), "cols\n")
+cat("  compustat:", format(nrow(compustat), big.mark = ","), "rows x", ncol(compustat), "cols\n")
+cat("  Columns match:", identical(names(wide_q), names(compustat)), "\n")
+```
+
+```{r show-final-columns}
+cat("Final column list:\n")
+cat(paste(names(wide_q), collapse = "\n"))
+```
+
+## Stack Datasets: Compustat (pre-2019) + wide_q (2019+)
+
+```{r stack-datasets}
+year <- 2026
+cat("Combining datasets...\n\n")
+
+# Check for bad years first
+cat("Year range check:\n")
+cat("  Compustat fyearq range:", min(compustat$fyearq, na.rm=TRUE), "-", max(compustat$fyearq, na.rm=TRUE), "\n")
+cat("  wide_q fyearq range:", min(wide_q$fyearq, na.rm=TRUE), "-", max(wide_q$fyearq, na.rm=TRUE), "\n")
+
+# Filter to valid years (1960-year should cover all reasonable data)
+compustat <- compustat[fyearq >= 1960 & fyearq <= year]
+wide_q <- wide_q[fyearq >= 1960 & fyearq <= year]
+
+cat("\nAfter filtering to valid years (1960-2030):\n")
+cat("  Compustat:", format(nrow(compustat), big.mark = ","), "rows\n")
+cat("  wide_q:", format(nrow(wide_q), big.mark = ","), "rows\n")
+
+# Cut off compustat before 2019
+compustat_pre2019 <- compustat[fyearq < 2019]
+cat("\nCompustat pre-2019:", format(nrow(compustat_pre2019), big.mark = ","), "rows\n")
+cat("  Years:", min(compustat_pre2019$fyearq), "-", max(compustat_pre2019$fyearq), "\n")
+cat("  Unique CIKs:", uniqueN(compustat_pre2019$cik), "\n")
+
+# wide_q is already 2019+
+cat("\nwide_q (2019+):", format(nrow(wide_q), big.mark = ","), "rows\n")
+cat("  Years:", min(wide_q$fyearq), "-", max(wide_q$fyearq), "\n")
+cat("  Unique CIKs:", uniqueN(wide_q$cik), "\n")
+
+# Stack them
+combined <- rbindlist(list(compustat_pre2019, wide_q), use.names = TRUE)
+setorder(combined, cik, fyearq, fqtr)
+
+cat("\nCombined dataset:\n")
+cat("  Rows:", format(nrow(combined), big.mark = ","), "\n")
+cat("  Years:", min(combined$fyearq), "-", max(combined$fyearq), "\n")
+cat("  Unique CIKs:", uniqueN(combined$cik), "\n")
+
+# Verify no overlap
+cat("\nVerify year coverage:\n")
+print(combined[, .N, by = .(source = fifelse(fyearq < 2019, "compustat", "wide_q"))][order(source)])
+```
+
+```{r save-combined}
+# Save combined dataset
+output_file <- "F:/LostInStandardization/output/fundamentals_combined.csv"
+fwrite(combined, output_file)
+sz <- file.info(output_file)$size / 1024^2
+cat("\nSaved:", output_file, "\n")
+cat("Size:", round(sz, 1), "MB\n")
+```
+
+```{r}
+combined[cik %in% 320193]
+```
+
