@@ -1,0 +1,1 @@
+These files use data from https://www.sec.gov/search-filings/edgar-application-programming-interfaces and US-GAAP Taxonomy files to extract company facts and standardize those facts as comparable line items. A file that compares coverage and dispersion relative to quarterly compustat data from 2019 to 2024 indicates a relatively successful automated standardization.
