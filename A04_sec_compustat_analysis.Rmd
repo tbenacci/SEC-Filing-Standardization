@@ -1,0 +1,601 @@
+---
+title: "SEC / Compustat Combination Analysis"
+author: "Thomas Benacci"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+```
+
+# Overview
+
+Diagnose the SEC→Compustat mapping quality for the overlap period
+(FY2019–2024, all quarters). For each target variable, measure:
+
+- **Coverage**: What fraction of CIK×quarter obs have a non-NA value in
+  each source? Where does one source report but the other doesn't?
+- **Dispersion**: Where both sources report, how closely do they agree?
+  Measured by median/p90 percent difference, and fraction within 1%/5%/10%.
+
+These results identify which XBRL mappings are working well and which
+variables need alternative tags or rollups.
+
+# Libraries
+
+```{r packages}
+library(data.table)
+setDTthreads(0)
+```
+
+# Load Data
+
+```{r load}
+sec <- fread("F:/LostInStandardization/output/compustat_quarterly_wide.csv")
+compustat <- fread("F:/CRSP/fundamental_quarterly_196103_202504.csv")
+cat("SEC:      ", format(nrow(sec), big.mark = ","), "rows,", ncol(sec), "cols\n")
+cat("Compustat:", format(nrow(compustat), big.mark = ","), "rows,", ncol(compustat), "cols\n")
+```
+
+# Prepare SEC Data (Mirror F04 Transformations)
+
+Apply the same aliases and YTD conversions as F04 so variables are
+comparable to Compustat.
+
+```{r sec-prep}
+# --- Simple aliases ---
+if ("ibq" %in% names(sec)) {
+  sec[, niq := ibq]
+  cat("  niq = ibq\n")
+}
+if ("saleq" %in% names(sec)) {
+  sec[, revtq := saleq]
+  cat("  revtq = saleq\n")
+}
+
+# --- FIX: D&A — use CF (total) as primary, not IS (non-production only) ---
+if ("dpcq" %in% names(sec)) {
+  sec[, dpq := dpcq]
+  cat("  dpq = dpcq (CF D&A, total — matches Compustat definition)\n")
+} else if ("dpq" %in% names(sec)) {
+  cat("  dpq = dpq (IS D&A only — no CF alternative)\n")
+}
+
+# --- FIX: mibq — use MIB (redeemable NCI) if available, else mibnq fallback ---
+if ("mibq" %in% names(sec)) {
+  cat("  mibq present (from MIB -> RedeemableNCI)\n")
+} else if ("mibnq" %in% names(sec)) {
+  sec[, mibq := mibnq]
+  cat("  mibq = mibnq (fallback: non-redeemable NCI, known mismatch)\n")
+}
+
+# ============================================================
+# ACCOUNTING IDENTITY IMPUTATION (per "Lost in Standardization")
+# ============================================================
+# If 2 of 3 items in an identity are reported, impute the 3rd.
+# Applied BEFORE NA→0 fills so identities use real reported values.
+cat("\n  === Accounting identity imputation ===\n")
+
+# Helper: for a 3-way identity A = B + C, impute whichever is missing
+impute_identity <- function(dt, a_col, b_col, c_col, label) {
+  if (!all(c(a_col, b_col, c_col) %in% names(dt))) return(invisible(0))
+  a <- dt[[a_col]]; b <- dt[[b_col]]; c <- dt[[c_col]]
+  # Impute A from B + C
+  mask_a <- is.na(a) & !is.na(b) & !is.na(c)
+  n_a <- sum(mask_a)
+  if (n_a > 0) dt[mask_a, (a_col) := get(b_col) + get(c_col)]
+  # Impute B from A - C
+  a <- dt[[a_col]]; b <- dt[[b_col]]; c <- dt[[c_col]]
+  mask_b <- !is.na(a) & is.na(b) & !is.na(c)
+  n_b <- sum(mask_b)
+  if (n_b > 0) dt[mask_b, (b_col) := get(a_col) - get(c_col)]
+  # Impute C from A - B
+  a <- dt[[a_col]]; b <- dt[[b_col]]; c <- dt[[c_col]]
+  mask_c <- !is.na(a) & !is.na(b) & is.na(c)
+  n_c <- sum(mask_c)
+  if (n_c > 0) dt[mask_c, (c_col) := get(a_col) - get(b_col)]
+  total <- n_a + n_b + n_c
+  if (total > 0) cat(sprintf("  %s: imputed %d (%s=%d, %s=%d, %s=%d)\n",
+                              label, total, a_col, n_a, b_col, n_b, c_col, n_c))
+  invisible(total)
+}
+
+# Identity 1: DebtCurrent = ShortTermBorrowings + LTDebtCapLeaseCurrent
+# dlcq = npq + dd1q
+impute_identity(sec, "dlcq", "npq", "dd1q", "DebtCurrent = NP + DD1")
+
+# Identity 2: CashAndSTInv = Cash + ShortTermInvestments
+# cheq = chq + ivstq
+impute_identity(sec, "cheq", "chq", "ivstq", "CHE = CH + IVST")
+
+# Identity 3: PPE Net = PPE Gross - Accumulated Depreciation
+# ppentq = ppegtq - dpactq
+impute_identity(sec, "ppentq", "ppegtq", "dpactq",
+                "PPENT = PPEGT - DPACT  [note: dpact subtracted]")
+# Actually this is A = B - C, so we handle it as A + C = B
+# Re-do: ppentq + dpactq = ppegtq  =>  ppegtq = ppentq + dpactq
+# Already handled if we treat (ppegtq, ppentq, dpactq) as ppegtq = ppentq + dpactq
+# The helper does A = B + C, so:
+#   ppegtq = ppentq + dpactq  (gross = net + accum depr)
+impute_identity(sec, "ppegtq", "ppentq", "dpactq", "PPEGT = PPENT + DPACT")
+
+# Identity 4: LongTermDebt = LTDebtNoncurrent + FinanceLeaseLiabNoncurrent
+# dlttq doesn't have these components mapped, but DLTT already includes them
+# via BFS. Skip for now.
+
+# Identity 5: OIBDP = OIADP + DP (already computed below, but impute if possible)
+# This is a derived variable, handled in computed vars section.
+
+cat("  === End accounting identity imputation ===\n\n")
+
+# --- FIX: NA → 0 for balance sheet items ---
+# SEC doesn't report a tag when value is zero. Compustat stores 0.
+# Applied BEFORE computed variables so ceqq, icaptq, etc. benefit.
+zero_if_na_vars <- c(
+  "invtq",   # Inventory: many firms (services, tech) have none
+  "pstkq",   # Preferred stock: most firms have none
+  "dlcq",    # Current debt: some firms have none
+  "dlttq",   # Long-term debt: some firms have none
+  "mibq",    # Noncontrolling interest: most firms have none
+  "rectq",   # Receivables
+  "apq"      # Accounts payable
+)
+fill_vars <- intersect(zero_if_na_vars, names(sec))
+if (length(fill_vars) > 0) {
+  n_filled <- sapply(fill_vars, function(v) {
+    n_na <- sum(is.na(sec[[v]]))
+    sec[is.na(get(v)), (v) := 0]
+    n_na
+  })
+  cat("  SEC NA -> 0 fills (balance sheet items):\n")
+  for (i in seq_along(fill_vars)) {
+    cat(sprintf("    %s: %s NAs -> 0\n", fill_vars[i], format(n_filled[i], big.mark = ",")))
+  }
+}
+
+# --- Computed variables (AFTER identity imputation + NA fill) ---
+if ("seqq" %in% names(sec) && "pstkq" %in% names(sec)) {
+  sec[, ceqq := seqq - fifelse(is.na(pstkq), 0, pstkq)]
+  cat("  ceqq = seqq - pstkq\n")
+} else if ("seqq" %in% names(sec)) {
+  sec[, ceqq := seqq]
+  cat("  ceqq = seqq (no pstkq)\n")
+}
+if ("oiadpq" %in% names(sec) && "dpq" %in% names(sec)) {
+  sec[, oibdpq := oiadpq + fifelse(is.na(dpq), 0, dpq)]
+  cat("  oibdpq = oiadpq + dpq\n")
+}
+if ("dlttq" %in% names(sec) && "dlcq" %in% names(sec) && "seqq" %in% names(sec)) {
+  sec[, icaptq := fifelse(is.na(dlttq), 0, dlttq) +
+                  fifelse(is.na(dlcq), 0, dlcq) +
+                  fifelse(is.na(seqq), 0, seqq)]
+  cat("  icaptq = dlttq + dlcq + seqq\n")
+}
+# --- YTD cumulative variables ---
+ytd_mapping <- list(oancfy = "oancfq", capxy = "capxq", ivncfy = "ivncfq", dvy = "dvq")
+if ("period" %in% names(sec)) {
+  sec[, period_num := match(period, c("Q1", "Q2", "Q3", "Q4"))]
+} else if ("fqtr" %in% names(sec)) {
+  sec[, period_num := fqtr]
+}
+if ("fy" %in% names(sec)) {
+  setorder(sec, cik, fy, period_num)
+  for (ycol in names(ytd_mapping)) {
+    qcol <- ytd_mapping[[ycol]]
+    if (qcol %in% names(sec)) {
+      sec[order(period_num),
+          (ycol) := cumsum(fifelse(is.na(get(qcol)), 0, get(qcol))),
+          by = .(cik, fy)]
+      cat(sprintf("  %s = cumsum(%s)\n", ycol, qcol))
+    }
+  }
+}
+sec[, period_num := NULL]
+
+# --- Rename to match Compustat conventions ---
+if ("fy"     %in% names(sec)) setnames(sec, "fy", "fyearq")
+if ("entity" %in% names(sec)) setnames(sec, "entity", "conm")
+if ("period" %in% names(sec)) {
+  sec[, fqtr := as.integer(gsub("Q", "", period))]
+  sec[, period := NULL]
+}
+cat("\nSEC after prep:", ncol(sec), "cols\n")
+```
+
+# Filter to FY2019–2024, All Quarters
+
+```{r filter}
+sec      <- sec[fyearq >= 2019 & fyearq <= 2024]
+compustat <- compustat[fyearq >= 2019 & fyearq <= 2024]
+compustat[, cik := as.integer(cik)]
+sec[, cik := as.integer(cik)]
+
+cat("After FY filter (2019-2024):\n")
+cat("  SEC:      ", format(nrow(sec), big.mark = ","), "rows,", uniqueN(sec$cik), "CIKs\n")
+cat("  Compustat:", format(nrow(compustat), big.mark = ","), "rows,", uniqueN(compustat$cik), "CIKs\n")
+cat("  Overlapping CIKs:", uniqueN(intersect(sec$cik, compustat$cik)), "\n")
+```
+
+# Define Analysis Variables
+
+```{r define-vars}
+# The 27 target Compustat columns (minus prccq which comes from price data)
+funda_cols <- c(
+  "cshoq", "ceqq", "seqq", "epspxq", "dlttq", "atq",
+  "niq", "saleq", "oibdpq", "cogsq", "piq", "oancfy", "icaptq", "revtq",
+  "actq", "lctq", "invtq", "dlcq", "cheq", "rectq", "apq",
+  "mibq", "pstkq", "capxy", "dvy", "ivncfy"
+)
+# Which of these exist in both datasets?
+both_have <- funda_cols[funda_cols %in% names(sec) & funda_cols %in% names(compustat)]
+sec_only  <- funda_cols[funda_cols %in% names(sec) & !funda_cols %in% names(compustat)]
+comp_only <- funda_cols[!funda_cols %in% names(sec) & funda_cols %in% names(compustat)]
+neither   <- funda_cols[!funda_cols %in% names(sec) & !funda_cols %in% names(compustat)]
+
+cat("Variables in both sources:", length(both_have), "\n")
+cat(" ", paste(both_have, collapse = ", "), "\n")
+if (length(sec_only) > 0)  cat("SEC only:  ", paste(sec_only, collapse = ", "), "\n")
+if (length(comp_only) > 0) cat("Comp only: ", paste(comp_only, collapse = ", "), "\n")
+if (length(neither) > 0)   cat("Neither:   ", paste(neither, collapse = ", "), "\n")
+```
+
+# Dedup Compustat (Share Classes)
+
+Compustat has multiple rows per (cik, fyearq, fqtr) for multi-class
+firms. Keep the row with the largest atq per (cik, fyearq, fqtr).
+
+```{r compustat-dedup}
+n_before <- nrow(compustat)
+setorder(compustat, cik, fyearq, fqtr, -atq)
+compustat <- compustat[!duplicated(compustat, by = c("cik", "fyearq", "fqtr"))]
+cat(sprintf("Compustat dedup: %s -> %s (dropped %s share-class dupes)\n",
+            format(n_before, big.mark = ","),
+            format(nrow(compustat), big.mark = ","),
+            format(n_before - nrow(compustat), big.mark = ",")))
+```
+
+# Dedup SEC
+
+```{r sec-dedup}
+n_before <- nrow(sec)
+setorder(sec, cik, fyearq, fqtr, -atq)
+sec <- sec[!duplicated(sec, by = c("cik", "fyearq", "fqtr"))]
+cat(sprintf("SEC dedup: %s -> %s (dropped %s)\n",
+            format(n_before, big.mark = ","),
+            format(nrow(sec), big.mark = ","),
+            format(n_before - nrow(sec), big.mark = ",")))
+```
+
+# Build Overlap Set
+
+Only (CIK, qtr) pairs where both sources have a row.
+
+```{r overlap}
+setkey(sec, cik, fyearq, fqtr)
+setkey(compustat, cik, fyearq, fqtr)
+
+overlap_keys <- fintersect(
+  sec[, .(cik, fyearq, fqtr)],
+  compustat[, .(cik, fyearq, fqtr)]
+)
+setkey(overlap_keys, cik, fyearq, fqtr)
+
+cat(sprintf("Overlap: %s (CIK, qtr) pairs (%s CIKs)\n",
+            format(nrow(overlap_keys), big.mark = ","),
+            format(uniqueN(overlap_keys$cik), big.mark = ",")))
+cat(sprintf("SEC-only quarters:      %s\n",
+            format(nrow(sec) - nrow(sec[overlap_keys, nomatch = NULL]), big.mark = ",")))
+cat(sprintf("Compustat-only quarters: %s\n",
+            format(nrow(compustat) - nrow(compustat[overlap_keys, nomatch = NULL]), big.mark = ",")))
+```
+
+# Coverage Analysis
+
+For each variable, across the overlap set: what fraction of obs are
+non-NA in each source?
+
+```{r coverage}
+cat("=== COVERAGE ANALYSIS (FY2019-2024, overlap quarters) ===\n\n")
+sec_overlap <- sec[overlap_keys, nomatch = NULL]
+comp_overlap <- compustat[overlap_keys, nomatch = NULL]
+# Ensure same row order
+setorder(sec_overlap, cik, fyearq, fqtr)
+setorder(comp_overlap, cik, fyearq, fqtr)
+stopifnot(nrow(sec_overlap) == nrow(comp_overlap))
+n_obs <- nrow(sec_overlap)
+coverage <- rbindlist(lapply(both_have, function(col) {
+  cv <- comp_overlap[[col]]
+  sv <- sec_overlap[[col]]
+  data.table(
+    variable     = col,
+    n_obs        = n_obs,
+    comp_nonNA   = sum(!is.na(cv)),
+    sec_nonNA    = sum(!is.na(sv)),
+    both_nonNA   = sum(!is.na(cv) & !is.na(sv)),
+    comp_only    = sum(!is.na(cv) & is.na(sv)),
+    sec_only     = sum(is.na(cv) & !is.na(sv)),
+    both_NA      = sum(is.na(cv) & is.na(sv)),
+    # Compustat reports 0 where SEC reports NA (common for items firm doesn't have)
+    comp0_secNA  = sum(!is.na(cv) & cv == 0 & is.na(sv), na.rm = TRUE)
+  )
+}))
+coverage[, `:=`(
+  comp_pct     = round(100 * comp_nonNA / n_obs, 1),
+  sec_pct      = round(100 * sec_nonNA / n_obs, 1),
+  both_pct     = round(100 * both_nonNA / n_obs, 1),
+  comp_only_pct = round(100 * comp_only / n_obs, 1),
+  sec_only_pct = round(100 * sec_only / n_obs, 1),
+  # Adjusted: treat comp=0/sec=NA as agreement (not a gap)
+  adj_gap      = comp_only - comp0_secNA,
+  adj_gap_pct  = round(100 * (comp_only - comp0_secNA) / n_obs, 1)
+)]
+cat("Coverage table (sorted by SEC coverage, ascending = worst gaps):\n\n")
+print(coverage[order(sec_pct),
+  .(variable, comp_pct, sec_pct, both_pct,
+    comp_only_pct, sec_only_pct, comp0_secNA, adj_gap_pct)])
+```
+
+```{r coverage-tiers}
+cat("\n\n=== COVERAGE TIERS ===\n\n")
+coverage[, tier := fcase(
+  sec_pct >= 80, "GOOD (>=80%)",
+  sec_pct >= 50, "MODERATE (50-80%)",
+  sec_pct >= 20, "WEAK (20-50%)",
+  default = "MISSING (<20%)"
+)]
+tier_summary <- coverage[, .N, by = tier][order(-N)]
+cat("Variables by SEC coverage tier:\n")
+print(tier_summary)
+cat("\nGOOD:\n  ", paste(coverage[tier == "GOOD (>=80%)", variable], collapse = ", "), "\n")
+cat("MODERATE:\n  ", paste(coverage[tier == "MODERATE (50-80%)", variable], collapse = ", "), "\n")
+cat("WEAK:\n  ", paste(coverage[tier == "WEAK (20-50%)", variable], collapse = ", "), "\n")
+cat("MISSING:\n  ", paste(coverage[tier == "MISSING (<20%)", variable], collapse = ", "), "\n")
+```
+
+# Dispersion Analysis
+
+For obs where both sources have non-NA, non-zero values: how different
+are they?
+
+```{r dispersion}
+cat("\n=== DISPERSION ANALYSIS (where both report non-NA, non-zero) ===\n\n")
+dispersion <- rbindlist(lapply(both_have, function(col) {
+  cv <- comp_overlap[[col]]
+  sv <- sec_overlap[[col]]
+  # Both non-NA
+  valid <- !is.na(cv) & !is.na(sv)
+  # Both non-zero (avoid div-by-zero and meaningless comparisons)
+  nz <- valid & abs(cv) > 1e-6 & abs(sv) > 1e-6
+  n_compare <- sum(nz)
+  if (n_compare < 10) {
+    return(data.table(
+      variable = col, n_compare = n_compare,
+      exact_pct = NA_real_, within_1pct = NA_real_,
+      within_5pct = NA_real_, within_10pct = NA_real_,
+      gt_50pct = NA_real_, gt_100pct = NA_real_,
+      med_pct_diff = NA_real_, p90_pct_diff = NA_real_,
+      mean_pct_diff = NA_real_
+    ))
+  }
+  # Pct difference: |comp/sec - 1| × 100
+  pct_diff <- abs(cv[nz] / sv[nz] - 1) * 100
+  data.table(
+    variable      = col,
+    n_compare     = n_compare,
+    exact_pct     = round(100 * mean(pct_diff < 0.01), 1),
+    within_1pct   = round(100 * mean(pct_diff < 1), 1),
+    within_5pct   = round(100 * mean(pct_diff < 5), 1),
+    within_10pct  = round(100 * mean(pct_diff < 10), 1),
+    gt_50pct      = round(100 * mean(pct_diff > 50), 1),
+    gt_100pct     = round(100 * mean(pct_diff > 100), 1),
+    med_pct_diff  = round(median(pct_diff), 3),
+    p90_pct_diff  = round(quantile(pct_diff, 0.90), 3),
+    mean_pct_diff = round(mean(pct_diff), 3)
+  )
+}))
+cat("Dispersion table (sorted by median pct diff, descending = worst):\n\n")
+print(dispersion[order(-within_1pct),
+  .(variable, n_compare, exact_pct, within_1pct, within_5pct,
+    gt_100pct, med_pct_diff, p90_pct_diff)])
+```
+
+```{r dispersion-tiers}
+cat("\n\n=== DISPERSION TIERS ===\n\n")
+dispersion[!is.na(med_pct_diff), disp_tier := fcase(
+  med_pct_diff < 0.01, "EXACT (<0.01%)",
+  med_pct_diff < 1,    "TIGHT (<1%)",
+  med_pct_diff < 5,    "ACCEPTABLE (1-5%)",
+  med_pct_diff < 20,   "LOOSE (5-20%)",
+  default = "BAD (>20%)"
+)]
+disp_tier_summary <- dispersion[!is.na(disp_tier), .N, by = disp_tier][order(N)]
+cat("Variables by dispersion tier:\n")
+print(disp_tier_summary)
+for (tier in c("EXACT (<0.01%)", "TIGHT (<1%)", "ACCEPTABLE (1-5%)", "LOOSE (5-20%)", "BAD (>20%)")) {
+  vars <- dispersion[disp_tier == tier, variable]
+  if (length(vars) > 0) cat(tier, ":\n  ", paste(vars, collapse = ", "), "\n")
+}
+```
+
+# Combined Quality Matrix
+
+Combine coverage + dispersion into a single quality assessment per
+variable.
+
+```{r quality-matrix}
+cat("\n=== COMBINED QUALITY MATRIX ===\n\n")
+quality <- merge(
+  coverage[, .(variable, sec_pct, both_pct, adj_gap_pct, tier)],
+  dispersion[, .(variable, n_compare, within_1pct, med_pct_diff, gt_100pct, disp_tier)],
+  by = "variable", all = TRUE
+)
+# Overall grade
+quality[, grade := fcase(
+  sec_pct >= 80 & !is.na(med_pct_diff) & med_pct_diff < 1,    "A",
+  sec_pct >= 80 & !is.na(med_pct_diff) & med_pct_diff < 5,    "B+",
+  sec_pct >= 50 & !is.na(med_pct_diff) & med_pct_diff < 5,    "B",
+  sec_pct >= 50 & !is.na(med_pct_diff) & med_pct_diff < 20,   "C",
+  sec_pct >= 20,                                                "D",
+  default = "F"
+)]
+setorder(quality, grade, -sec_pct)
+cat("Quality matrix (A=excellent through F=failing):\n\n")
+print(quality[, .(variable, sec_pct, both_pct, med_pct_diff, within_1pct,
+                   gt_100pct, tier, disp_tier, grade)])
+cat("\n\nGrade distribution:\n")
+print(quality[, .N, by = grade][order(grade)])
+```
+
+# Per-Year Coverage Trends
+
+Does SEC coverage improve or degrade over fiscal years?
+
+```{r coverage-by-year}
+cat("\n=== COVERAGE BY FISCAL YEAR ===\n\n")
+yearly_cov <- rbindlist(lapply(both_have, function(col) {
+  rbindlist(lapply(2019:2024, function(yr) {
+    cv <- comp_overlap[fyearq == yr][[col]]
+    sv <- sec_overlap[fyearq == yr][[col]]
+    n <- length(cv)
+    if (n == 0) return(NULL)
+    data.table(
+      variable = col,
+      fyearq   = yr,
+      n_obs    = n,
+      comp_pct = round(100 * sum(!is.na(cv)) / n, 1),
+      sec_pct  = round(100 * sum(!is.na(sv)) / n, 1),
+      both_pct = round(100 * sum(!is.na(cv) & !is.na(sv)) / n, 1)
+    )
+  }))
+}))
+# Show for key variables
+key_vars <- c("atq", "saleq", "niq", "cheq", "dlttq", "oancfy",
+              "seqq", "cogsq", "oibdpq", "piq")
+key_vars <- intersect(key_vars, both_have)
+cat("SEC coverage (%) by year for key variables:\n\n")
+yearly_wide <- dcast(yearly_cov[variable %in% key_vars], variable ~ fyearq,
+                     value.var = "sec_pct")
+print(yearly_wide)
+```
+
+# Per-Year Dispersion Trends
+
+```{r dispersion-by-year}
+cat("\n=== DISPERSION BY FISCAL YEAR ===\n\n")
+yearly_disp <- rbindlist(lapply(both_have, function(col) {
+  rbindlist(lapply(2019:2024, function(yr) {
+    cv <- comp_overlap[fyearq == yr][[col]]
+    sv <- sec_overlap[fyearq == yr][[col]]
+    nz <- !is.na(cv) & !is.na(sv) & abs(cv) > 1e-6 & abs(sv) > 1e-6
+    n_compare <- sum(nz)
+    if (n_compare < 5) return(NULL)
+    pct_diff <- abs(cv[nz] / sv[nz] - 1) * 100
+    data.table(
+      variable     = col,
+      fyearq       = yr,
+      n_compare    = n_compare,
+      med_pct_diff = round(median(pct_diff), 3),
+      within_1pct  = round(100 * mean(pct_diff < 1), 1)
+    )
+  }))
+}))
+cat("Median % diff by year for key variables:\n\n")
+disp_wide <- dcast(yearly_disp[variable %in% key_vars], variable ~ fyearq,
+                   value.var = "med_pct_diff")
+print(disp_wide)
+```
+
+# Worst Offender Drill-Down
+
+For variables with poor coverage or high dispersion, show sample CIKs
+to help identify the root cause.
+
+```{r worst-offenders}
+cat("\n=== DRILL-DOWN: PROBLEM VARIABLES ===\n\n")
+# Variables graded D or F
+problem_vars <- quality[grade %in% c("D", "F"), variable]
+if (length(problem_vars) == 0) {
+  cat("No variables graded D or F. Showing C-grade variables instead.\n")
+  problem_vars <- quality[grade == "C", variable]
+}
+for (col in problem_vars) {
+  if (!col %in% names(comp_overlap) || !col %in% names(sec_overlap)) next
+  cv <- comp_overlap[[col]]
+  sv <- sec_overlap[[col]]
+  cat(sprintf("\n--- %s (grade: %s) ---\n", col, quality[variable == col, grade]))
+  # Coverage breakdown
+  n_both <- sum(!is.na(cv) & !is.na(sv))
+  n_comp_only <- sum(!is.na(cv) & is.na(sv))
+  n_sec_only <- sum(is.na(cv) & !is.na(sv))
+  cat(sprintf("  Both have value: %d | Comp only: %d | SEC only: %d\n",
+              n_both, n_comp_only, n_sec_only))
+  # Where Compustat has non-NA, non-zero but SEC is NA: these are coverage gaps
+  gap_mask <- !is.na(cv) & cv != 0 & is.na(sv)
+  n_real_gap <- sum(gap_mask)
+  cat(sprintf("  Real coverage gaps (comp non-zero, SEC NA): %d (%.1f%%)\n",
+              n_real_gap, 100 * n_real_gap / n_obs))
+  # Sample CIKs with gaps
+  if (n_real_gap > 0) {
+    gap_ciks <- sec_overlap[gap_mask, .(cik, fyearq, fqtr)]
+    gap_freq <- gap_ciks[, .N, by = cik][order(-N)]
+    cat(sprintf("  CIKs with most gaps (top 5):\n"))
+    print(head(gap_freq, 5))
+  }
+  # Dispersion: sample of worst disagreements
+  nz <- !is.na(cv) & !is.na(sv) & abs(cv) > 1e-6 & abs(sv) > 1e-6
+  if (sum(nz) > 0) {
+    pct_diff <- rep(NA_real_, length(cv))
+    pct_diff[nz] <- abs(cv[nz] / sv[nz] - 1) * 100
+    bad_idx <- which(nz & pct_diff > 50)
+    if (length(bad_idx) > 0) {
+      bad_dt <- data.table(
+        cik       = sec_overlap$cik[bad_idx],
+        fyearq    = sec_overlap$fyearq[bad_idx],
+        fqtr      = sec_overlap$fqtr[bad_idx],
+        comp_val  = cv[bad_idx],
+        sec_val   = sv[bad_idx],
+        pct_diff  = round(pct_diff[bad_idx], 1)
+      )
+      cat(sprintf("  Worst disagreements (>50%% diff): %d rows\n", nrow(bad_dt)))
+      cat("  Sample (top 5 by magnitude):\n")
+      print(head(bad_dt[order(-abs(pct_diff))], 5))
+    }
+  }
+}
+```
+
+# Summary
+
+```{r summary}
+cat("\n========================================\n")
+cat("MAPPING QUALITY SUMMARY (FY2019-2024)\n")
+cat("========================================\n\n")
+cat(sprintf("Overlap set: %s CIK×quarter pairs, %s CIKs\n",
+            format(nrow(overlap_keys), big.mark = ","),
+            format(uniqueN(overlap_keys$cik), big.mark = ",")))
+cat(sprintf("Variables analysed: %d / %d\n", length(both_have), length(funda_cols)))
+cat(sprintf("\nGrade A  (high coverage, tight match):  %d vars\n", sum(quality$grade == "A")))
+cat(sprintf("Grade B+ (high coverage, good match):   %d vars\n", sum(quality$grade == "B+")))
+cat(sprintf("Grade B  (moderate coverage, good):     %d vars\n", sum(quality$grade == "B")))
+cat(sprintf("Grade C  (moderate, loose):             %d vars\n", sum(quality$grade == "C")))
+cat(sprintf("Grade D  (weak coverage):               %d vars\n", sum(quality$grade == "D")))
+cat(sprintf("Grade F  (failing):                     %d vars\n", sum(quality$grade == "F")))
+cat("\nACTION ITEMS — Variables needing mapping improvement:\n")
+action <- quality[grade %in% c("C", "D", "F"), .(variable, sec_pct, med_pct_diff, grade)]
+setorder(action, grade, -med_pct_diff)
+if (nrow(action) > 0) {
+  print(action)
+} else {
+  cat("  None — all variables at B or above.\n")
+}
+```
+
+```{r}
+coverage
+```
+
+```{r}
+dispersion
+```
+

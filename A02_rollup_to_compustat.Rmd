@@ -1,0 +1,301 @@
+---
+title: "Rollup to Compustat Tags"
+author: "Thomas Benacci"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  facts_file: "F:/LostInStandardization/output/extracted_facts.csv"
+  lookup_file: "F:/LostInStandardization/output/tag_lookup.tsv"
+  output_path: "F:/LostInStandardization/output"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+```
+
+# Libraries
+
+```{r packages}
+library(data.table)
+setDTthreads(0)
+```
+
+# Build Rollup Rules from Lookup
+
+The lookup table defines which XBRL tags roll up to which Compustat tags. Built from the latest available taxonomy and applied uniformly to all filings (see F01_extract_facts).
+
+```{r load-lookup}
+LOOKUP <- fread(params$lookup_file)
+cat("Lookup:\n")
+cat("  Rows:", format(nrow(LOOKUP), big.mark = ","), "\n")
+cat("  Columns:", paste(names(LOOKUP), collapse = ", "), "\n")
+cat("  Unique compustat targets:", uniqueN(LOOKUP$compustat_name), "\n")
+```
+
+# Load Facts
+
+```{r load-facts}
+FACTS <- fread(params$facts_file)
+cat("Facts loaded:\n")
+cat("  Rows:", format(nrow(FACTS), big.mark = ","), "\n")
+cat("  Columns:", paste(names(FACTS), collapse = ", "), "\n")
+```
+
+```{r filter-current-period}
+# Each unique filing (accn: accession number) contains data for multiple periods (as a company typically does when it presents it's written financial statements for investors to examine)
+# A single 10-K may contain full-year AND quarterly breakdowns for the same tag
+# We need to select the appropriate period based on filing type:
+# 10-K/10-K/A: want full-year rows (duration > 300 days)
+# 10-Q/10-Q/A: want single-quarter rows (duration < 120 days)
+FACTS[, end := as.IDate(end)]
+FACTS[, start := as.IDate(start)]
+FACTS[, duration := as.integer(end - start)]
+# Classify filing type
+FACTS[, is_annual := form %chin% c("10-K", "10-K/A", "10-KT", "10-KT/A")]
+# For annual filings: keep full-year rows (duration > 300 days)
+# For quarterly filings: keep single-quarter rows (duration 60-120 days typical)
+FACTS_ANNUAL <- FACTS[is_annual == TRUE & duration > 300]
+FACTS_QUARTERLY <- FACTS[is_annual == FALSE & duration < 120 & duration > 60]
+# Fallback: if no rows match duration criteria, use original logic (max end)
+FACTS_ANNUAL_FALLBACK <- FACTS[is_annual == TRUE & !paste(cik, accn, tag) %chin% 
+                                paste(FACTS_ANNUAL$cik, FACTS_ANNUAL$accn, FACTS_ANNUAL$tag)]
+FACTS_QUARTERLY_FALLBACK <- FACTS[is_annual == FALSE & !paste(cik, accn, tag) %chin% 
+                                   paste(FACTS_QUARTERLY$cik, FACTS_QUARTERLY$accn, FACTS_QUARTERLY$tag)]
+# For fall-backs, take max end date
+if (nrow(FACTS_ANNUAL_FALLBACK) > 0) {
+  setorder(FACTS_ANNUAL_FALLBACK, cik, accn, tag, -end, -duration)
+  FACTS_ANNUAL_FALLBACK <- FACTS_ANNUAL_FALLBACK[, .SD[1], by = .(cik, accn, tag)]
+}
+if (nrow(FACTS_QUARTERLY_FALLBACK) > 0) {
+  setorder(FACTS_QUARTERLY_FALLBACK, cik, accn, tag, -end)
+  FACTS_QUARTERLY_FALLBACK <- FACTS_QUARTERLY_FALLBACK[, .SD[1], by = .(cik, accn, tag)]
+}
+# For main sets, also de-duplicate (in case of ties)
+if (nrow(FACTS_ANNUAL) > 0) {
+  setorder(FACTS_ANNUAL, cik, accn, tag, -end, -duration)
+  FACTS_ANNUAL <- FACTS_ANNUAL[, .SD[1], by = .(cik, accn, tag)]
+}
+if (nrow(FACTS_QUARTERLY) > 0) {
+  setorder(FACTS_QUARTERLY, cik, accn, tag, -end)
+  FACTS_QUARTERLY <- FACTS_QUARTERLY[, .SD[1], by = .(cik, accn, tag)]
+}
+# Combine all
+FACTS <- rbindlist(list(FACTS_ANNUAL, FACTS_ANNUAL_FALLBACK, 
+                        FACTS_QUARTERLY, FACTS_QUARTERLY_FALLBACK), fill = TRUE)
+FACTS[, c("duration", "is_annual") := NULL]
+cat("\nAfter filtering to current period only:\n")
+cat("  Rows:", format(nrow(FACTS), big.mark = ","), "\n")
+```
+
+# Apply Rollup Calculations
+
+In a perfect world, all tags would have values and be thoroughly completed. However, sometimes a parent tag is missing even though it's children have non-NA values. This necessitates a roll up to the parent via parent = sum(child val * child weight), where weight is either 1 or -1. 
+
+```{r rollup}
+# Flatten lookup: one row per (compustat_name, child_tag, weight)
+FLAT <- LOOKUP[, .(
+  compustat_name, 
+  target_tag, 
+  child_tag, 
+  weight = weight_path
+)]
+cat("Flattened lookup:", format(nrow(FLAT), big.mark = ","), "rows\n")
+# Step 3a: Get directly reported values for target tags
+# These are facts where tag == target_tag (the compustat-level tag itself)
+target_tags <- unique(FLAT$target_tag)
+REPORTED <- FACTS[tag %chin% target_tags, .(
+  cik, entity, accn, form, fy, fp, filed, start, end, tax_year,
+  target_tag = tag,
+  val, unit,
+  source = "reported"
+)]
+# Add compustat_name — deduplicate to avoid cartesian join
+# (supplemental mappings can cause a target_tag to appear under multiple compustat_names)
+tag_info <- unique(FLAT[, .(target_tag, compustat_name)])
+primary  <- unique(FLAT[target_tag == child_tag, .(target_tag, compustat_name)])
+secondary <- tag_info[!primary, on = .(target_tag, compustat_name)]
+tag_info_dedup <- rbindlist(list(primary, secondary))
+tag_info_dedup <- tag_info_dedup[!duplicated(tag_info_dedup, by = "target_tag")]
+REPORTED <- tag_info_dedup[REPORTED, on = "target_tag"]
+cat("Directly reported:", format(nrow(REPORTED), big.mark = ","), "rows\n")
+
+# Step 3b: Calculate rolled-up values from children
+# Join facts with flat lookup on tag only (lookup is from latest taxonomy, applied to all years)
+setkey(FACTS, tag)
+setkey(FLAT, child_tag)
+MAPPED <- FLAT[FACTS, on = .(child_tag = tag), nomatch = NULL, allow.cartesian = TRUE]
+MAPPED[, weighted_val := val * weight]
+
+# ============================================================
+# FIX: Prevent double-counting in BFS rollup
+# ============================================================
+# Problem: If a company reports BOTH a parent (e.g., LongTermDebtAndCapitalLease
+# ObligationsCurrent = 200) AND its child (LongTermDebtCurrent = 200), the naive
+# sum counts both = 400. The child's value is already embedded in the parent.
+#
+# Solution: For each (cik, accn, end, compustat_name) context, build the set of
+# reported child_tags. If a child_tag is an ANCESTOR of another reported child_tag
+# in the same context, the descendant is already included — drop the descendant.
+# Equivalently: keep only the HIGHEST-LEVEL reported tags (no ancestors also reported).
+
+# ============================================================
+# FIX: Prevent double-counting in BFS rollup
+# ============================================================
+# Problem: If a company reports BOTH a parent (e.g., LongTermDebtAndCapitalLease
+# ObligationsCurrent = 200) AND its child (LongTermDebtCurrent = 200), the naive
+# sum counts both = 400. The child's value is already embedded in the parent.
+#
+# Solution: Within each (cik, accn, end, compustat_name) context, keep only the
+# SHALLOWEST reported child_tags. If tag A (depth 1) is an ancestor of tag B
+# (depth 2), B is already included in A, so drop B.
+#
+# We determine ancestor relationships using the taxonomy calculation sheet.
+
+cat("\nAnti-double-counting: building ancestor index from taxonomy...\n")
+
+# Load taxonomy to get parent-child edges
+tax_file <- file.path(dirname(params$lookup_file), "..", "input", "US_GAAP_Taxonomy_2026.xlsx")
+# Try multiple possible locations
+tax_candidates <- c(
+  tax_file,
+  "F:/LostInStandardization/input/US_GAAP_Taxonomy_2026.xlsx",
+  file.path(dirname(params$lookup_file), "US_GAAP_Taxonomy_2026.xlsx")
+)
+tax_found <- NULL
+for (tc in tax_candidates) {
+  if (file.exists(tc)) { tax_found <- tc; break }
+}
+
+if (!is.null(tax_found)) {
+  library(openxlsx)
+  calc <- read.xlsx(tax_found, sheet = "Calculation")
+  calc <- as.data.table(calc)
+  # Clean column names (they vary)
+  if ("name" %in% names(calc)) setnames(calc, "name", "element")
+  if ("parent" %in% names(calc)) {
+    calc[, parent := sub("^us-gaap:", "", parent)]
+    calc[, parent := sub("^srt:", "", parent)]
+  }
+  edges <- unique(calc[!is.na(parent) & !is.na(element) & parent != element,
+                        .(parent, child = element)])
+  cat(sprintf("  Loaded %s parent-child edges from taxonomy\n",
+              format(nrow(edges), big.mark = ",")))
+} else {
+  # Fallback: infer edges from FLAT using depth differences
+  # If child_tag has depth > 0 relative to target, it's a descendant
+  # We approximate parent-child from the BFS traversal order
+  cat("  WARNING: Taxonomy file not found. Using FLAT depth heuristic.\n")
+  edges <- data.table(parent = character(0), child = character(0))
+}
+
+if (nrow(edges) > 0) {
+  # Build transitive closure: (descendant, ancestor) pairs
+  anc_pairs <- edges[, .(descendant = child, ancestor = parent)]
+  frontier <- copy(anc_pairs)
+  for (d in 1:15) {
+    next_level <- edges[frontier, on = .(child = ancestor),
+                        .(descendant = i.descendant, ancestor = x.parent),
+                        nomatch = NULL]
+    next_level <- next_level[!is.na(ancestor)]
+    next_level <- fsetdiff(next_level, anc_pairs)
+    if (nrow(next_level) == 0) break
+    anc_pairs <- rbindlist(list(anc_pairs, next_level))
+    frontier <- next_level
+  }
+  anc_pairs <- unique(anc_pairs)
+  cat(sprintf("  Ancestor pairs: %s\n", format(nrow(anc_pairs), big.mark = ",")))
+  
+  # For each row in MAPPED, check if any ancestor of its child_tag is also
+  # present in the same context.
+  n_before <- nrow(MAPPED)
+  MAPPED[, ctx := paste(cik, accn, end, compustat_name, sep = "|")]
+  
+  ctx_child <- unique(MAPPED[, .(ctx, child_tag)])
+  
+  # Find (ctx, child_tag) pairs that have an ancestor also in ctx
+  has_anc <- anc_pairs[ctx_child, on = .(descendant = child_tag),
+                       .(ctx = i.ctx, child_tag = i.child_tag, ancestor),
+                       nomatch = NULL, allow.cartesian = TRUE]
+  
+  has_anc[, anc_key := paste(ctx, ancestor, sep = "||")]
+  ctx_child[, ctx_key := paste(ctx, child_tag, sep = "||")]
+  reported_keys <- unique(ctx_child$ctx_key)
+  
+  drop_pairs <- has_anc[anc_key %chin% reported_keys, .(ctx, child_tag)]
+  drop_pairs <- unique(drop_pairs)
+  
+  if (nrow(drop_pairs) > 0) {
+    drop_pairs[, drop_key := paste(ctx, child_tag, sep = "||")]
+    MAPPED[, map_key := paste(ctx, child_tag, sep = "||")]
+    MAPPED[, drop := map_key %chin% drop_pairs$drop_key]
+    n_dropped <- sum(MAPPED$drop)
+    cat(sprintf("  Dropped %s double-counted rows (%.1f%%)\n",
+                format(n_dropped, big.mark = ","), 100 * n_dropped / n_before))
+    MAPPED <- MAPPED[drop == FALSE]
+    MAPPED[, c("drop", "map_key") := NULL]
+  } else {
+    cat("  No double-counting detected.\n")
+  }
+  MAPPED[, ctx := NULL]
+  rm(has_anc, drop_pairs, ctx_child, anc_pairs, edges, frontier)
+  gc(verbose = FALSE)
+} else {
+  cat("  Skipping anti-double-counting (no edges available).\n")
+}
+
+# Aggregate: sum weighted values per context + compustat tag
+CALCULATED <- MAPPED[, .(
+  val = sum(weighted_val, na.rm = TRUE),
+  n_children = .N,
+  unit = unit[1]
+), by = .(cik, entity, accn, form, fy, fp, filed, start, end, tax_year, 
+          compustat_name, target_tag)]
+CALCULATED[, source := "calculated"]
+cat("Calculated from children:", format(nrow(CALCULATED), big.mark = ","), "rows\n")
+rm(MAPPED)
+gc(verbose = FALSE)
+# Step 3c: Combine - prefer reported over calculated
+# Create context key for matching
+REPORTED[, ctx := paste(cik, accn, end, compustat_name, sep = "|")]
+CALCULATED[, ctx := paste(cik, accn, end, compustat_name, sep = "|")]
+# Keep calculated only where no reported value exists
+reported_ctx <- unique(REPORTED$ctx)
+CALCULATED_NEW <- CALCULATED[!ctx %chin% reported_ctx]
+cat("Calculated (after removing where reported exists):", format(nrow(CALCULATED_NEW), big.mark = ","), "rows\n")
+# Combine
+REPORTED[, n_children := NA_integer_]
+COMPUSTAT <- rbindlist(list(REPORTED, CALCULATED_NEW), use.names = TRUE, fill = TRUE)
+COMPUSTAT[, ctx := NULL]
+cat("\nFinal result:", format(nrow(COMPUSTAT), big.mark = ","), "rows\n")
+cat("  Reported:", sum(COMPUSTAT$source == "reported"), "\n")
+cat("  Calculated:", sum(COMPUSTAT$source == "calculated"), "\n")
+rm(REPORTED, CALCULATED, CALCULATED_NEW)
+gc(verbose = FALSE)
+```
+
+# Save Output
+
+```{r save}
+# Reorder columns
+col_order <- c("cik", "entity", "accn", "form", "fy", "fp", "filed", "start", "end",
+               "tax_year", "compustat_name", "target_tag", "val", "unit", "n_children")
+setcolorder(COMPUSTAT, intersect(col_order, names(COMPUSTAT)))
+output_file <- file.path(params$output_path, "compustat_values.csv")
+fwrite(COMPUSTAT, output_file)
+sz <- file.info(output_file)$size / 1024^2
+cat("\nSaved:", output_file, "\n")
+cat("Size:", round(sz, 1), "MB\n")
+```
+
+# Summary
+
+```{r summary}
+cat("\n=== SUMMARY ===\n")
+cat("\nBy compustat tag:\n")
+print(COMPUSTAT[, .(n = .N, mean_val = mean(val, na.rm = TRUE)), by = compustat_name][order(-n)][1:20])
+cat("\nBy form:\n")
+print(COMPUSTAT[, .N, by = form][order(-N)])
+cat("\nBy fiscal year:\n")
+print(COMPUSTAT[, .N, by = fy][order(fy)])
+```
+
